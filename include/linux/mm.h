@@ -146,6 +146,7 @@ extern unsigned int kobjsize(const void *objp);
 #define VM_ARCH_1	0x01000000	/* Architecture-specific flag */
 #define VM_ARCH_2	0x02000000
 #define VM_DONTDUMP	0x04000000	/* Do not include in the core dump */
+#define VM_GPU_MAPPED 	0x08000000	/* GPU mmaped VMA */
 
 #ifdef CONFIG_MEM_SOFT_DIRTY
 # define VM_SOFTDIRTY	0x08000000	/* Not soft dirty clean area */
@@ -242,6 +243,19 @@ struct vm_fault {
 	pgoff_t max_pgoff;		/* map pages for offset from pgoff till
 					 * max_pgoff inclusive */
 	pte_t *pte;			/* pte entry associated with ->pgoff */
+};
+
+struct vm_ucm_operations_struct {
+	/* vma - current vma, start - virtual address the mapping starts at (==shared_addr)*/
+	struct file *(*get_mmaped_file)(struct vm_area_struct *vma, unsigned long start, unsigned long end);
+	unsigned long int (*get_cpu_addr)(struct vm_area_struct *vma, unsigned long start, unsigned long end);
+	int (*invalidate_cached_page)(struct vm_area_struct *vma, unsigned long virt_addr);
+	int (*retrive_cached_page)(unsigned long virt_addr, struct page *cpu_page);
+	int (*retrive_16cached_pages)(unsigned long virt_addr, struct page *pages_arr[]);
+	/* Recived the struct page of the gpu_page that was foundin page cahe and returns true if this
+	 * page is dirty on the GPU. Note that this means that 16 cpu pages corresponding to this gpu_page
+	 * have to be invalidated on CPU*/
+	int (*is_gpu_page_dirty)(struct vm_area_struct *vma, struct page *gpu_page);
 };
 
 /*

@@ -348,6 +348,10 @@ struct vm_area_struct {
 	struct file * vm_file;		/* File we map to (can be NULL). */
 	void * vm_private_data;		/* was vm_pte (shared mem) */
 
+	bool gpu_mapped;
+	bool gpu_mapped_shared;
+	const struct vm_ucm_operations_struct *ucm_vm_ops;
+
 #ifndef CONFIG_MMU
 	struct vm_region *vm_region;	/* NOMMU mapping region */
 #endif

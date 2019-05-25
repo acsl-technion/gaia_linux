@@ -47,6 +47,9 @@ static const struct trace_print_flags pageflag_names[] = {
 	{1UL << PG_young,		"young"		},
 	{1UL << PG_idle,		"idle"		},
 #endif
+	{1UL << PG_onGPU,		"on_GPU"	},
+	{1UL << PG_dirty_GPU,               "dirty_GPU"        },
+	{1UL << PG_from_GPU,               "from_GPU"        },
 };
 
 static void dump_flags(unsigned long flags,

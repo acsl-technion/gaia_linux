@@ -108,6 +108,9 @@ enum pageflags {
 	PG_young,
 	PG_idle,
 #endif
+	PG_onGPU,
+	PG_dirty_GPU,
+	PG_from_GPU,
 	__NR_PAGEFLAGS,
 
 	/* Filesystems */
