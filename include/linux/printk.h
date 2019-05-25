@@ -257,6 +257,22 @@ extern asmlinkage void dump_stack(void) __cold;
 	printk(KERN_NOTICE pr_fmt(fmt), ##__VA_ARGS__)
 #define pr_info(fmt, ...) \
 	printk(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__)
+
+#define UCM_PRINT_FUNC_PREFIX(prefix, fmt, ...)	\
+	printk(prefix "%s:%u %s " fmt,	\
+	kbasename(__FILE__),		\
+	__LINE__,			\
+	__FUNCTION__,			\
+	##__VA_ARGS__)
+
+#define UCM_ERR(fmt, ...)	\
+	UCM_PRINT_FUNC_PREFIX(KERN_ERR, "UCM-ERR " fmt, ##__VA_ARGS__)
+#define UCM_INFO(fmt, ...)	\
+	UCM_PRINT_FUNC_PREFIX(KERN_INFO, "UCM-INFO " fmt, ##__VA_ARGS__)
+#define UCM_DBG(fmt, ...)	\
+	UCM_PRINT_FUNC_PREFIX(KERN_NOTICE, "UCM-DBG " fmt, ##__VA_ARGS__)
+
+
 /*
  * Like KERN_CONT, pr_cont() should only be used when continuing
  * a line with no newline ('\n') enclosed. Otherwise it defaults
