@@ -130,9 +130,33 @@ static void mpage_end_io(struct bio *bio)
 	bio_put(bio);
 }
 
-int ext4_mpage_readpages(struct address_space *mapping,
-			 struct list_head *pages, struct page *page,
-			 unsigned nr_pages)
+static void mpage_end_io_dummy(struct bio *bio)
+{
+	struct bio_vec *bv;
+	int i;
+
+	bio_for_each_segment_all(bv, bio, i) {
+		struct page *page = bv->bv_page;
+		char *tmp_addr;
+		if (!bio->bi_error) {
+			SetPageUptodate(page);
+		} else {
+			ClearPageUptodate(page);
+			SetPageError(page);
+		}
+		unlock_page(page);
+	//	tmp_addr = (char *)kmap(page);
+		//memset(tmp_addr, 0, PAGE_SIZE);
+	//	kunmap(page);
+		//UCM_DBG("unlocked page @  idx = %ld, flags = 0x%llx\n", page->index, page->flags);
+	}
+
+	bio_put(bio);
+}
+
+int ext4_mpage_readpages_extended(struct address_space *mapping,
+		 struct list_head *pages, struct page *page,
+		 unsigned nr_pages, bool submit)
 {
 	struct bio *bio = NULL;
 	unsigned page_idx;
@@ -184,8 +208,8 @@ int ext4_mpage_readpages(struct address_space *mapping,
 		 * Map blocks using the previous result first.
 		 */
 		if ((map.m_flags & EXT4_MAP_MAPPED) &&
-		    block_in_file > map.m_lblk &&
-		    block_in_file < (map.m_lblk + map.m_len)) {
+			block_in_file > map.m_lblk &&
+			block_in_file < (map.m_lblk + map.m_len)) {
 			unsigned map_offset = block_in_file - map.m_lblk;
 			unsigned last = map.m_len - map_offset;
 
@@ -260,7 +284,7 @@ int ext4_mpage_readpages(struct address_space *mapping,
 			SetPageMappedToDisk(page);
 		}
 		if (fully_mapped && blocks_per_page == 1 &&
-		    !PageUptodate(page) && cleancache_get_page(page) == 0) {
+			!PageUptodate(page) && cleancache_get_page(page) == 0) {
 			SetPageUptodate(page);
 			goto confused;
 		}
@@ -271,14 +295,18 @@ int ext4_mpage_readpages(struct address_space *mapping,
 		 */
 		if (bio && (last_block_in_bio != blocks[0] - 1)) {
 		submit_and_realloc:
-			submit_bio(READ, bio);
+			if	(submit)
+				submit_bio(READ, bio);
+			else {
+				mpage_end_io_dummy(bio);
+			}
 			bio = NULL;
 		}
 		if (bio == NULL) {
 			struct ext4_crypto_ctx *ctx = NULL;
 
 			if (ext4_encrypted_inode(inode) &&
-			    S_ISREG(inode->i_mode)) {
+				S_ISREG(inode->i_mode)) {
 				ctx = ext4_get_crypto_ctx(inode, GFP_NOFS);
 				if (IS_ERR(ctx))
 					goto set_error_page;
@@ -301,28 +329,50 @@ int ext4_mpage_readpages(struct address_space *mapping,
 			goto submit_and_realloc;
 
 		if (((map.m_flags & EXT4_MAP_BOUNDARY) &&
-		     (relative_block == map.m_len)) ||
-		    (first_hole != blocks_per_page)) {
-			submit_bio(READ, bio);
+			 (relative_block == map.m_len)) ||
+			(first_hole != blocks_per_page)) {
+			if (submit)
+				submit_bio(READ, bio);
+			else {
+				mpage_end_io_dummy(bio);
+			}
 			bio = NULL;
 		} else
 			last_block_in_bio = blocks[blocks_per_page - 1];
 		goto next_page;
 	confused:
 		if (bio) {
-			submit_bio(READ, bio);
+			if (submit)
+				submit_bio(READ, bio);
+			else {
+				mpage_end_io_dummy(bio);
+			}
 			bio = NULL;
 		}
-		if (!PageUptodate(page))
+		if (!PageUptodate(page)) {
+			if (!submit)
 			block_read_full_page(page, ext4_get_block);
-		else
+		} else
 			unlock_page(page);
 	next_page:
 		if (pages)
 			page_cache_release(page);
 	}
 	BUG_ON(pages && !list_empty(pages));
-	if (bio)
-		submit_bio(READ, bio);
+	if (bio) {
+		if (submit)
+			submit_bio(READ, bio);
+		else {
+			mpage_end_io_dummy(bio);
+		}
+	}
 	return 0;
+}
+
+int ext4_mpage_readpages(struct address_space *mapping,
+			 struct list_head *pages, struct page *page,
+			 unsigned nr_pages)
+{
+	return ext4_mpage_readpages_extended(mapping,
+			 pages, page, nr_pages, true);
 }

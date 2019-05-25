@@ -1455,7 +1455,7 @@ int zap_vma_ptes(struct vm_area_struct *vma, unsigned long address,
 	zap_page_range_single(vma, address, size, NULL);
 	return 0;
 }
-EXPORT_SYMBOL_GPL(zap_vma_ptes);
+EXPORT_SYMBOL(zap_vma_ptes);
 
 pte_t *__get_locked_pte(struct mm_struct *mm, unsigned long addr,
 			spinlock_t **ptl)

@@ -641,6 +641,8 @@ static void __set_page_dirty(struct page *page, struct address_space *mapping,
 		account_page_dirtied(page, mapping, memcg);
 		radix_tree_tag_set(&mapping->page_tree,
 				page_index(page), PAGECACHE_TAG_DIRTY);
+		radix_tree_tag_set(&mapping->page_tree,
+                                page_index(page), PAGECACHE_TAG_CPU_DIRTY);
 	}
 	spin_unlock_irqrestore(&mapping->tree_lock, flags);
 }
@@ -676,8 +678,10 @@ int __set_page_dirty_buffers(struct page *page)
 	struct mem_cgroup *memcg;
 	struct address_space *mapping = page_mapping(page);
 
-	if (unlikely(!mapping))
+	if (unlikely(!mapping)) {
+		SetPagedirty_GPU(page);
 		return !TestSetPageDirty(page);
+	}
 
 	spin_lock(&mapping->private_lock);
 	if (page_has_buffers(page)) {
@@ -694,6 +698,10 @@ int __set_page_dirty_buffers(struct page *page)
 	 * per-memcg dirty page counters.
 	 */
 	memcg = mem_cgroup_begin_page_stat(page);
+	if (mapping)
+		radix_tree_tag_set(&mapping->page_tree,
+				page_index(page), PAGECACHE_TAG_CPU_DIRTY);
+	SetPagedirty_GPU(page);
 	newly_dirty = !TestSetPageDirty(page);
 	spin_unlock(&mapping->private_lock);
 
@@ -1179,6 +1187,7 @@ void mark_buffer_dirty(struct buffer_head *bh)
 		struct mem_cgroup *memcg;
 
 		memcg = mem_cgroup_begin_page_stat(page);
+		SetPagedirty_GPU(page);
 		if (!TestSetPageDirty(page)) {
 			mapping = page_mapping(page);
 			if (mapping)

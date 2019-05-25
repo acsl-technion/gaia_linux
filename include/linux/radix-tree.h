@@ -27,6 +27,7 @@
 #include <linux/kernel.h>
 #include <linux/rcupdate.h>
 
+#include <linux/ucm.h>
 /*
  * An indirect pointer (root->rnode pointing to a radix_tree_node, rather
  * than a data item) is signalled by the low bit set in the root->rnode
@@ -58,7 +59,7 @@ static inline int radix_tree_is_indirect_ptr(void *ptr)
 
 /*** radix-tree API starts here ***/
 
-#define RADIX_TREE_MAX_TAGS 3
+#define RADIX_TREE_MAX_TAGS 5
 
 #ifdef __KERNEL__
 #define RADIX_TREE_MAP_SHIFT	(CONFIG_BASE_SMALL ? 4 : 6)
@@ -84,6 +85,26 @@ static inline int radix_tree_is_indirect_ptr(void *ptr)
 #define RADIX_TREE_COUNT_SHIFT	(RADIX_TREE_MAP_SHIFT + 1)
 #define RADIX_TREE_COUNT_MASK	((1UL << RADIX_TREE_COUNT_SHIFT) - 1)
 
+/*
+ * In the current version RADIX_TREE_MAP_SIZE = 64 so we can represent
+ * 4 GPU pages in one node. It is easier just ot add pointers to those pages
+ * to the tree node. A bit of a memory overhead because I dont need this
+ * array for nodes that are not at the last level but I expect it to be not
+ * to great.
+ * See gpu_pages field bellow.
+ */
+#define NUM_GPU_PAGES (RADIX_TREE_MAP_SIZE / 16)
+
+static  __maybe_unused void print_version(long *version) {
+	int i;
+	//UCM_DBG("VERSION: ");
+	for (i = 0; i < SYS_PROCS; i++)
+		pr_err("%s: %ld\n", proc_names[i], version[i]);
+	pr_err("-\n");
+}
+
+typedef long tsvt_vector_t[SYS_PROCS];
+
 struct radix_tree_node {
 	unsigned int	path;	/* Offset in parent & height from the bottom */
 	unsigned int	count;
@@ -100,6 +121,14 @@ struct radix_tree_node {
 	/* For tree user */
 	struct list_head private_list;
 	void __rcu	*slots[RADIX_TREE_MAP_SIZE];
+
+	/* For each of the RADIX_TREE_MAP_SIZE pages pointed by the node,
+	 * TSVT[page_num][proc_id] holds the version vector of the page
+	 * as seen by this processor.
+	 */
+	tsvt_vector_t			TSVT[RADIX_TREE_MAP_SIZE][SYS_PROCS];
+	void 		*gpu_pages[SYS_PROCS][NUM_GPU_PAGES];
+	unsigned long			count_gpu;
 	unsigned long	tags[RADIX_TREE_MAX_TAGS][RADIX_TREE_TAG_LONGS];
 };
 
@@ -265,8 +294,14 @@ int __radix_tree_create(struct radix_tree_root *root, unsigned long index,
 int radix_tree_insert(struct radix_tree_root *, unsigned long, void *);
 void *__radix_tree_lookup(struct radix_tree_root *root, unsigned long index,
 			  struct radix_tree_node **nodep, void ***slotp);
+
+void *__radix_tree_lookup_dbg(struct radix_tree_root *root, unsigned long index,
+			  struct radix_tree_node **nodep, void ***slotp);
+
 void *radix_tree_lookup(struct radix_tree_root *, unsigned long);
 void **radix_tree_lookup_slot(struct radix_tree_root *, unsigned long);
+void **radix_tree_lookup_slot_node(struct radix_tree_root *root, unsigned long index,
+		struct radix_tree_node **node);
 bool __radix_tree_delete_node(struct radix_tree_root *root,
 			      struct radix_tree_node *node);
 void *radix_tree_delete_item(struct radix_tree_root *, unsigned long, void *);
@@ -324,6 +359,7 @@ struct radix_tree_iter {
 	unsigned long	index;
 	unsigned long	next_index;
 	unsigned long	tags;
+	struct radix_tree_node *node;
 };
 
 #define RADIX_TREE_ITER_TAG_MASK	0x00FF	/* tag index in lower byte */
@@ -350,6 +386,7 @@ radix_tree_iter_init(struct radix_tree_iter *iter, unsigned long start)
 	 */
 	iter->index = 0;
 	iter->next_index = start;
+	iter->node = NULL;
 	return NULL;
 }
 

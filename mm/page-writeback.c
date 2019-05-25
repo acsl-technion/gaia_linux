@@ -2108,13 +2108,19 @@ void tag_pages_for_writeback(struct address_space *mapping,
 			     pgoff_t start, pgoff_t end)
 {
 #define WRITEBACK_TAG_BATCH 4096
-	unsigned long tagged;
+	unsigned long tagged, tagged_gpu;
 
 	do {
+		pgoff_t bkp_start = start;
 		spin_lock_irq(&mapping->tree_lock);
 		tagged = radix_tree_range_tag_if_tagged(&mapping->page_tree,
 				&start, end, WRITEBACK_TAG_BATCH,
 				PAGECACHE_TAG_DIRTY, PAGECACHE_TAG_TOWRITE);
+		tagged_gpu = radix_tree_range_tag_if_tagged(&mapping->page_tree,
+                                &bkp_start, end, WRITEBACK_TAG_BATCH,
+                                PAGECACHE_TAG_DIRTY, PAGECACHE_TAG_CPU_DIRTY);
+		if (tagged != tagged_gpu)
+			UCM_ERR("tagged =%lu tagged_gpu=%lu\n", tagged, tagged_gpu);
 		spin_unlock_irq(&mapping->tree_lock);
 		WARN_ON_ONCE(tagged > WRITEBACK_TAG_BATCH);
 		cond_resched();
@@ -2397,8 +2403,10 @@ EXPORT_SYMBOL(write_one_page);
  */
 int __set_page_dirty_no_writeback(struct page *page)
 {
-	if (!PageDirty(page))
+	if (!PageDirty(page)) {
+		SetPagedirty_GPU(page);
 		return !TestSetPageDirty(page);
+	}
 	return 0;
 }
 
@@ -2467,6 +2475,7 @@ int __set_page_dirty_nobuffers(struct page *page)
 	struct mem_cgroup *memcg;
 
 	memcg = mem_cgroup_begin_page_stat(page);
+	SetPagedirty_GPU(page);
 	if (!TestSetPageDirty(page)) {
 		struct address_space *mapping = page_mapping(page);
 		unsigned long flags;
@@ -2482,6 +2491,8 @@ int __set_page_dirty_nobuffers(struct page *page)
 		account_page_dirtied(page, mapping, memcg);
 		radix_tree_tag_set(&mapping->page_tree, page_index(page),
 				   PAGECACHE_TAG_DIRTY);
+		radix_tree_tag_set(&mapping->page_tree, page_index(page),
+                                   PAGECACHE_TAG_CPU_DIRTY);
 		spin_unlock_irqrestore(&mapping->tree_lock, flags);
 		mem_cgroup_end_page_stat(memcg);
 
@@ -2573,6 +2584,7 @@ int set_page_dirty(struct page *page)
 		return (*spd)(page);
 	}
 	if (!PageDirty(page)) {
+		SetPagedirty_GPU(page);
 		if (!TestSetPageDirty(page))
 			return 1;
 	}
@@ -2775,10 +2787,13 @@ int __test_set_page_writeback(struct page *page, bool keep_write)
 			if (bdi_cap_account_writeback(bdi))
 				__inc_wb_stat(inode_to_wb(inode), WB_WRITEBACK);
 		}
-		if (!PageDirty(page))
+		if (!PageDirty(page)) {
 			radix_tree_tag_clear(&mapping->page_tree,
 						page_index(page),
 						PAGECACHE_TAG_DIRTY);
+			//radix_tree_tag_set(&mapping->page_tree, page_index(page),
+            //                       PAGECACHE_TAG_CPU_DIRTY);
+		}
 		if (!keep_write)
 			radix_tree_tag_clear(&mapping->page_tree,
 						page_index(page),

@@ -3064,6 +3064,24 @@ static int ext4_readpage(struct file *file, struct page *page)
 	return ret;
 }
 
+static int ext4_readpage_dummy(struct file *file, struct page *page)
+{
+	int ret = -EAGAIN;
+	struct inode *inode = page->mapping->host;
+
+	trace_ext4_readpage(page);
+
+	if (ext4_has_inline_data(inode)) {
+		UCM_DBG("calling ext4_readpage_inline\n");
+		ret = ext4_readpage_inline(inode, page);
+	}
+
+	if (ret == -EAGAIN)
+		return ext4_mpage_readpages_extended(page->mapping, NULL, page, 1, false);
+
+	return ret;
+}
+
 static int
 ext4_readpages(struct file *file, struct address_space *mapping,
 		struct list_head *pages, unsigned nr_pages)
@@ -3394,6 +3412,7 @@ static int ext4_journalled_set_page_dirty(struct page *page)
 
 static const struct address_space_operations ext4_aops = {
 	.readpage		= ext4_readpage,
+	.readpage_dummy		= ext4_readpage_dummy,
 	.readpages		= ext4_readpages,
 	.writepage		= ext4_writepage,
 	.writepages		= ext4_writepages,
@@ -3410,6 +3429,7 @@ static const struct address_space_operations ext4_aops = {
 
 static const struct address_space_operations ext4_journalled_aops = {
 	.readpage		= ext4_readpage,
+	.readpage_dummy		= ext4_readpage_dummy,
 	.readpages		= ext4_readpages,
 	.writepage		= ext4_writepage,
 	.writepages		= ext4_writepages,
@@ -3426,6 +3446,7 @@ static const struct address_space_operations ext4_journalled_aops = {
 
 static const struct address_space_operations ext4_da_aops = {
 	.readpage		= ext4_readpage,
+	.readpage_dummy		= ext4_readpage_dummy,
 	.readpages		= ext4_readpages,
 	.writepage		= ext4_writepage,
 	.writepages		= ext4_writepages,

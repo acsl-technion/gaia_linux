@@ -3093,6 +3093,10 @@ extern int ext4_mpage_readpages(struct address_space *mapping,
 				struct list_head *pages, struct page *page,
 				unsigned nr_pages);
 
+extern int ext4_mpage_readpages_extended(struct address_space *mapping,
+		 struct list_head *pages, struct page *page,
+		 unsigned nr_pages, bool submit);
+
 /* symlink.c */
 extern const struct inode_operations ext4_encrypted_symlink_inode_operations;
 extern const struct inode_operations ext4_symlink_inode_operations;

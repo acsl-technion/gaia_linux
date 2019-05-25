@@ -369,6 +369,7 @@ typedef int (*read_actor_t)(read_descriptor_t *, struct page *,
 struct address_space_operations {
 	int (*writepage)(struct page *page, struct writeback_control *wbc);
 	int (*readpage)(struct file *, struct page *);
+	int (*readpage_dummy)(struct file *, struct page *);
 
 	/* Write back some dirty pages from this mapping. */
 	int (*writepages)(struct address_space *, struct writeback_control *);
@@ -440,6 +441,11 @@ struct address_space {
 	spinlock_t		private_lock;	/* for use by the address_space */
 	struct list_head	private_list;	/* ditto */
 	void			*private_data;	/* ditto */
+	struct list_head gpu_lra;
+	/* All of the below are in gpu pages*/
+    unsigned long   gpu_cached_data_sz;
+    unsigned long   gpu_cache_sz;
+    unsigned long   gpu_cache_limit;
 } __attribute__((aligned(sizeof(long))));
 	/*
 	 * On most architectures that alignment is already the case; but
@@ -492,6 +498,8 @@ struct block_device {
 #define PAGECACHE_TAG_DIRTY	0
 #define PAGECACHE_TAG_WRITEBACK	1
 #define PAGECACHE_TAG_TOWRITE	2
+#define PAGECACHE_TAG_CPU_DIRTY	3
+#define PAGECACHE_TAG_ON_GPU	4
 
 int mapping_tagged(struct address_space *mapping, int tag);
 

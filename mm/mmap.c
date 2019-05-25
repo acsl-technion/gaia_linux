@@ -1316,6 +1316,18 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	if (mm->map_count > sysctl_max_map_count)
 		return -ENOMEM;
 
+	if (unlikely(flags & MAP_ON_GPU)) {
+		if (file) {
+			if (!file->f_mapping->gpu_cache_sz) 
+				INIT_LIST_HEAD(&file->f_mapping->gpu_lra);
+			else
+				UCM_ERR("\n\n\n\nBADDDDD\n\n\n");
+			vm_flags |= VM_GPU_MAPPED;
+		} else {
+			UCM_ERR("Got MAP_GPU but file = null\n");
+		}
+	}
+
 	/* Obtain the address to map to. we verify (or select) it and ensure
 	 * that it represents a valid section of the address space.
 	 */
@@ -1632,6 +1644,10 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 			error = mapping_map_writable(file->f_mapping);
 			if (error)
 				goto allow_write_and_free_vma;
+		}
+		if (vm_flags & VM_GPU_MAPPED) {
+			vma->gpu_mapped = true;
+			vma->vm_flags |= VM_MIXEDMAP;
 		}
 
 		/* ->mmap() can change vma->vm_file, but must guarantee that

@@ -15,6 +15,8 @@
 #include <linux/hardirq.h> /* for in_interrupt() */
 #include <linux/hugetlb_inline.h>
 
+#include <linux/ucm.h>
+
 /*
  * Bits in mapping->flags.  The lower __GFP_BITS_SHIFT bits are the page
  * allocation mode flags.
@@ -258,8 +260,43 @@ pgoff_t page_cache_prev_hole(struct address_space *mapping,
 #define FGP_NOWAIT		0x00000020
 #define FGP_ON_GPU		0x00000040
 
+struct page *pagecache_get_page_ucm(struct vm_area_struct *vma, struct address_space *mapping, pgoff_t offset,
+		int fgp_flags, gfp_t cache_gfp_mask);
+
 struct page *pagecache_get_page(struct address_space *mapping, pgoff_t offset,
 		int fgp_flags, gfp_t cache_gfp_mask);
+
+struct page *pagecache_get_gpu_page(struct address_space *mapping, pgoff_t offset,
+	int gpu_id, bool ignore_version);
+
+void increase_page_version(struct address_space *mapping, pgoff_t offset,
+		enum system_processors proc_id);
+int get_page_version_on(struct address_space *mapping, pgoff_t offset,
+		enum system_processors proc_id, long *page_v);
+int get_page_latest_version(struct address_space *mapping,
+		unsigned long offset, long *page_v);
+void set_page_version_as_on(struct address_space *mapping, pgoff_t offset,
+		enum system_processors proc_id_to_set, enum system_processors proc_id_set_as) ;
+enum system_processors get_best_src_for_page(struct address_space *mapping, long offset);
+struct page *get_page_from_gpu(struct address_space *mapping, pgoff_t offset,
+		struct page *page);
+int get_multi_pages_from_gpu(struct address_space *mapping, struct file *filp, struct list_head *page_pool, unsigned nr_pages);
+
+int get_16pages_from_gpu(struct address_space *mapping, pgoff_t start_offset,
+		struct page **pages, int num_pages);
+
+void print_TSVT(struct address_space *mapping, unsigned nr_pages);
+
+void do_sync_mmap_readahead(struct vm_area_struct *vma,
+				   struct file_ra_state *ra,
+				   struct file *file,
+				   pgoff_t offset);
+
+void do_async_mmap_readahead(struct vm_area_struct *vma,
+				    struct file_ra_state *ra,
+				    struct file *file,
+				    struct page *page,
+				    pgoff_t offset);
 
 /**
  * find_get_page - find and get a page reference
@@ -276,6 +313,10 @@ static inline struct page *find_get_page(struct address_space *mapping,
 {
 	return pagecache_get_page(mapping, offset, 0, 0);
 }
+
+#ifdef CONFIG_MMU
+int page_cache_read(struct file *file, pgoff_t offset);
+#endif
 
 static inline struct page *find_get_page_flags(struct address_space *mapping,
 					pgoff_t offset, int fgp_flags)
@@ -351,7 +392,7 @@ static inline struct page *grab_cache_page_nowait(struct address_space *mapping,
 			mapping_gfp_mask(mapping));
 }
 
-struct page *find_get_entry(struct address_space *mapping, pgoff_t offset);
+struct page *find_get_entry(struct address_space *mapping, pgoff_t offset, int eflags);
 struct page *find_lock_entry(struct address_space *mapping, pgoff_t offset);
 unsigned find_get_entries(struct address_space *mapping, pgoff_t start,
 			  unsigned int nr_entries, struct page **entries,
@@ -362,6 +403,8 @@ unsigned find_get_pages_contig(struct address_space *mapping, pgoff_t start,
 			       unsigned int nr_pages, struct page **pages);
 unsigned find_get_pages_tag(struct address_space *mapping, pgoff_t *index,
 			int tag, unsigned int nr_pages, struct page **pages);
+unsigned find_get_taged_pages_idx(struct address_space *mapping, pgoff_t *index,
+			unsigned int nr_pages, int *pages_idx, unsigned int tag);
 
 struct page *grab_cache_page_write_begin(struct address_space *mapping,
 			pgoff_t index, unsigned flags);
@@ -654,6 +697,8 @@ static inline int fault_in_multipages_readable(const char __user *uaddr,
 	return 0;
 }
 
+int add_to_page_cache_gpu(struct page *page, struct address_space *mapping,
+				pgoff_t index, gfp_t gfp_mask, int gpu_id);
 int add_to_page_cache_locked(struct page *page, struct address_space *mapping,
 				pgoff_t index, gfp_t gfp_mask);
 int add_to_page_cache_lru(struct page *page, struct address_space *mapping,
@@ -661,6 +706,8 @@ int add_to_page_cache_lru(struct page *page, struct address_space *mapping,
 extern void delete_from_page_cache(struct page *page);
 extern void __delete_from_page_cache(struct page *page, void *shadow,
 				     struct mem_cgroup *memcg);
+extern void __delete_from_page_cache_gpu(struct page *page, void *shadow,
+				     struct mem_cgroup *memcg, int gpu_idx);
 int replace_page_cache_page(struct page *old, struct page *new, gfp_t gfp_mask);
 
 /*

@@ -266,8 +266,9 @@ static inline void workingset_node_pages_inc(struct radix_tree_node *node)
 
 static inline void workingset_node_pages_dec(struct radix_tree_node *node)
 {
-	VM_WARN_ON_ONCE(!workingset_node_pages(node));
-	node->count--;
+	VM_WARN_ON_ONCE(node->count <= 0);
+	if (node->count > 0)
+		node->count--;
 }
 
 static inline unsigned int workingset_node_shadows(struct radix_tree_node *node)

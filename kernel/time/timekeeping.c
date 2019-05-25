@@ -723,7 +723,7 @@ ktime_t ktime_get(void)
 
 	return ktime_add_ns(base, nsecs);
 }
-EXPORT_SYMBOL_GPL(ktime_get);
+EXPORT_SYMBOL(ktime_get);
 
 u32 ktime_get_resolution_ns(void)
 {

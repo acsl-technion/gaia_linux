@@ -213,7 +213,18 @@ TESTPAGEFLAG(Locked, locked)
 PAGEFLAG(Error, error) TESTCLEARFLAG(Error, error)
 PAGEFLAG(Referenced, referenced) TESTCLEARFLAG(Referenced, referenced)
 	__SETPAGEFLAG(Referenced, referenced)
-PAGEFLAG(Dirty, dirty) TESTSCFLAG(Dirty, dirty) __CLEARPAGEFLAG(Dirty, dirty)
+
+static inline int PageDirty(const struct page *page)			\
+				{ return test_bit(PG_dirty, &page->flags); }		\
+static inline void SetPageDirty(struct page *page)			\
+				{ set_bit(PG_dirty, &page->flags);  set_bit(PG_dirty_GPU, &page->flags);}
+static inline void ClearPageDirty(struct page *page)			\
+				{ clear_bit(PG_dirty, &page->flags); }
+static inline int TestSetPageDirty(struct page *page)			\
+		{ set_bit(PG_dirty_GPU, &page->flags); return test_and_set_bit(PG_dirty, &page->flags); }
+static inline int TestClearPageDirty(struct page *page)		\
+		{ return test_and_clear_bit(PG_dirty, &page->flags); }
+//PAGEFLAG(Dirty, dirty) TESTSCFLAG(Dirty, dirty) __CLEARPAGEFLAG(Dirty, dirty)
 PAGEFLAG(LRU, lru) __CLEARPAGEFLAG(LRU, lru)
 PAGEFLAG(Active, active) __CLEARPAGEFLAG(Active, active)
 	TESTCLEARFLAG(Active, active)
@@ -338,6 +349,10 @@ static inline int PageKsm(struct page *page)
 #else
 TESTPAGEFLAG_FALSE(Ksm)
 #endif
+
+PAGEFLAG(onGPU, onGPU)
+PAGEFLAG(dirty_GPU, dirty_GPU)
+PAGEFLAG(from_GPU, from_GPU)
 
 u64 stable_page_flags(struct page *page);
 

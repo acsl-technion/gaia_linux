@@ -34,7 +34,7 @@
 #include <linux/bitops.h>
 #include <linux/rcupdate.h>
 #include <linux/preempt.h>		/* in_interrupt() */
-
+#include <linux/fs.h>
 
 /*
  * The height_to_maxindex array needs to be one deeper than the maximum
@@ -182,6 +182,7 @@ radix_tree_node_alloc(struct radix_tree_root *root)
 {
 	struct radix_tree_node *ret = NULL;
 	gfp_t gfp_mask = root_gfp_mask(root);
+	int i,proc_id, page_num, j;
 
 	/*
 	 * Preload code isn't irq safe and it doesn't make sence to use
@@ -213,6 +214,21 @@ radix_tree_node_alloc(struct radix_tree_root *root)
 		ret = kmem_cache_alloc(radix_tree_node_cachep, gfp_mask);
 
 	BUG_ON(radix_tree_is_indirect_ptr(ret));
+
+	for (i = 0; i < SYS_PROCS; i++) {
+		for (j = 0; j < NUM_GPU_PAGES; j++)
+			ret->gpu_pages[i][j] = NULL;
+	}
+	ret->count_gpu = 0;
+	memset(ret->TSVT, 0, sizeof(long)*SYS_PROCS*RADIX_TREE_MAP_SIZE*SYS_PROCS);
+	for (page_num = 0; page_num < RADIX_TREE_MAP_SIZE; page_num++) {
+		for (proc_id = 0; proc_id < SYS_PROCS; proc_id++){
+			for (j = 0; j < SYS_PROCS; j++)
+				ret->TSVT[page_num][proc_id][j] = -1;
+			ret->TSVT[page_num][proc_id][SYS_DISK] = 0;
+		}
+		ret->TSVT[page_num][SYS_DISK][SYS_DISK] = 0;
+	}
 	return ret;
 }
 
@@ -232,6 +248,7 @@ static void radix_tree_node_rcu_free(struct rcu_head *head)
 
 	node->slots[0] = NULL;
 	node->count = 0;
+	WARN_ON(node->count_gpu);
 
 	kmem_cache_free(radix_tree_node_cachep, node);
 }
@@ -239,6 +256,7 @@ static void radix_tree_node_rcu_free(struct rcu_head *head)
 static inline void
 radix_tree_node_free(struct radix_tree_node *node)
 {
+	WARN_ON(node->count_gpu);
 	call_rcu(&node->rcu_head, radix_tree_node_rcu_free);
 }
 
@@ -361,6 +379,7 @@ static int radix_tree_extend(struct radix_tree_root *root, unsigned long index)
 		if (newheight > 1) {
 			slot = indirect_to_ptr(slot);
 			slot->parent = node;
+			node->count_gpu = slot->count_gpu;
 		}
 		node->slots[0] = slot;
 		node = ptr_to_indirect(node);
@@ -395,7 +414,7 @@ int __radix_tree_create(struct radix_tree_root *root, unsigned long index,
 	int error;
 
 	/* Make sure the tree is high enough.  */
-	if (index > radix_tree_maxindex(root->height)) {
+	if (index > radix_tree_maxindex(root->height) /*|| !root->height*/) {
 		error = radix_tree_extend(root, index);
 		if (error)
 			return error;
@@ -431,7 +450,8 @@ int __radix_tree_create(struct radix_tree_root *root, unsigned long index,
 	}
 
 	if (nodep)
-		*nodep = node;
+		*nodep = (node ? node : root->rnode);
+
 	if (slotp)
 		*slotp = node ? node->slots + offset : (void **)&root->rnode;
 	return 0;
@@ -451,6 +471,8 @@ int radix_tree_insert(struct radix_tree_root *root,
 	struct radix_tree_node *node;
 	void **slot;
 	int error;
+	int i, j;
+	tsvt_vector_t page_v;
 
 	BUG_ON(radix_tree_is_indirect_ptr(item));
 
@@ -463,6 +485,21 @@ int radix_tree_insert(struct radix_tree_root *root,
 
 	if (node) {
 		node->count++;
+		/*
+		 * What is the latest version for this page?
+		 * NOTE that if the latest version is on GPU
+		 * this code is not handling this at the moment!
+		 */
+		for (i = 0; i < SYS_PROCS; i++) {
+			page_v[i] = -1;
+			for (j = 0; j < SYS_PROCS; j++)
+				page_v[i] = max(page_v[i], node->TSVT[index % RADIX_TREE_MAP_SIZE][j][i]);
+		}
+		page_v[SYS_CPU]++;
+		/* Now set the version for this page*/
+		for (i = 0; i < SYS_PROCS; i++)
+			node->TSVT[index % RADIX_TREE_MAP_SIZE][SYS_CPU][i] =
+					page_v[i];
 		BUG_ON(tag_get(node, 0, index & RADIX_TREE_MAP_MASK));
 		BUG_ON(tag_get(node, 1, index & RADIX_TREE_MAP_MASK));
 	} else {
@@ -521,8 +558,63 @@ void *__radix_tree_lookup(struct radix_tree_root *root, unsigned long index,
 		parent = node;
 		slot = node->slots + ((index >> shift) & RADIX_TREE_MAP_MASK);
 		node = rcu_dereference_raw(*slot);
-		if (node == NULL)
+		if (node == NULL) {
+			if (nodep)
+				*nodep = parent;
 			return NULL;
+		}
+
+		shift -= RADIX_TREE_MAP_SHIFT;
+		height--;
+	} while (height > 0);
+
+	if (nodep)
+		*nodep = parent;
+	if (slotp)
+		*slotp = slot;
+	return node;
+}
+
+void *__radix_tree_lookup_dbg(struct radix_tree_root *root, unsigned long index,
+			  struct radix_tree_node **nodep, void ***slotp)
+{
+	struct radix_tree_node *node, *parent, *root_node;
+	unsigned int height, shift;
+	void **slot;
+
+	node = rcu_dereference_raw(root->rnode);
+	if (node == NULL)
+		return NULL;
+
+	if (!radix_tree_is_indirect_ptr(node)) {
+		if (index > 0) 
+			return NULL;
+
+		if (nodep)
+			*nodep = indirect_to_ptr(node);//NULL;
+		if (slotp)
+			*slotp = (void **)&root->rnode;
+		return node;
+	}
+	node = indirect_to_ptr(node);
+	root_node = node;
+
+	height = node->path & RADIX_TREE_HEIGHT_MASK;
+	if (index > radix_tree_maxindex(height)) {
+		*nodep = node;
+		return NULL;
+	}
+
+	shift = (height-1) * RADIX_TREE_MAP_SHIFT;
+
+	do {
+		parent = node;
+		slot = node->slots + ((index >> shift) & RADIX_TREE_MAP_MASK);
+		node = rcu_dereference_raw(*slot);
+		if (node == NULL) {
+			*nodep = root_node;
+			return NULL;
+		}
 
 		shift -= RADIX_TREE_MAP_SHIFT;
 		height--;
@@ -557,6 +649,17 @@ void **radix_tree_lookup_slot(struct radix_tree_root *root, unsigned long index)
 	return slot;
 }
 EXPORT_SYMBOL(radix_tree_lookup_slot);
+
+void **radix_tree_lookup_slot_node(struct radix_tree_root *root, unsigned long index,
+		struct radix_tree_node **node)
+{
+	void **slot;
+
+	if (!__radix_tree_lookup(root, index, node, &slot))
+		return NULL;
+	return slot;
+}
+EXPORT_SYMBOL(radix_tree_lookup_slot_node);
 
 /**
  *	radix_tree_lookup    -    perform lookup operation on a radix tree
@@ -608,14 +711,25 @@ void *radix_tree_tag_set(struct radix_tree_root *root,
 		if (!tag_get(slot, tag, offset))
 			tag_set(slot, tag, offset);
 		slot = slot->slots[offset];
-		BUG_ON(slot == NULL);
+		if (tag != PAGECACHE_TAG_ON_GPU)
+			BUG_ON(slot == NULL);
 		shift -= RADIX_TREE_MAP_SHIFT;
 		height--;
 	}
 
-	/* set the root's tag bit */
-	if (slot && !root_tag_get(root, tag))
-		root_tag_set(root, tag);
+	if (!slot && tag != PAGECACHE_TAG_ON_GPU) {
+		/* set the root's tag bit */
+		if (slot && !root_tag_get(root, tag))
+			root_tag_set(root, tag);
+	} else {
+		/*
+		 * if slot !=null -> set tag for root.
+		 * if slot =null then tag = ongpu ->set tag for root
+		 */
+		if (!root_tag_get(root, tag))
+			root_tag_set(root, tag);
+	}
+
 
 	return slot;
 }
@@ -660,7 +774,7 @@ void *radix_tree_tag_clear(struct radix_tree_root *root,
 		slot = slot->slots[offset];
 	}
 
-	if (slot == NULL)
+	if (slot == NULL && tag != PAGECACHE_TAG_ON_GPU && tag != PAGECACHE_TAG_CPU_DIRTY)
 		goto out;
 
 	while (node) {
@@ -780,6 +894,7 @@ void **radix_tree_next_chunk(struct radix_tree_root *root,
 		iter->index = 0;
 		iter->next_index = 1;
 		iter->tags = 1;
+		iter->node = root->rnode;
 		return (void **)&root->rnode;
 	} else
 		return NULL;
@@ -853,7 +968,7 @@ restart:
 			iter->next_index = index + BITS_PER_LONG;
 		}
 	}
-
+	iter->node = node;
 	return node->slots + offset;
 }
 EXPORT_SYMBOL(radix_tree_next_chunk);
@@ -909,6 +1024,22 @@ unsigned long radix_tree_range_tag_if_tagged(struct radix_tree_root *root,
 	if (height == 0) {
 		*first_indexp = last_index + 1;
 		root_tag_set(root, settag);
+		if (settag == PAGECACHE_TAG_CPU_DIRTY && iftag == PAGECACHE_TAG_DIRTY && !root_tag_get(root, settag)) {
+			int i;
+			node = indirect_to_ptr(root->rnode);
+			/*
+			 * If the tree consists only from root node I don't know what page exactly is the
+			 * dirty on so I increase the version for all the 64 pages as an overkill.
+			 * Perhaps can fix this by going over all of them and looking at the dirty bit but
+			 * it might not work for future updates. Overkill is the safer option
+			 */
+			for (i = 0; i < RADIX_TREE_MAP_SIZE; i++)
+				if (node->slots[i]) {
+					//node->latest_version[i]++;
+					WARN_ON(node->TSVT[i][SYS_CPU][SYS_CPU] == -1);
+					node->TSVT[i][SYS_CPU][SYS_CPU]++;// = node->latest_version[i];
+				}
+		}
 		return 1;
 	}
 
@@ -934,6 +1065,18 @@ unsigned long radix_tree_range_tag_if_tagged(struct radix_tree_root *root,
 
 		/* tag the leaf */
 		tagged++;
+		if (settag == PAGECACHE_TAG_CPU_DIRTY && iftag == PAGECACHE_TAG_DIRTY) {
+			if (!slot->slots[offset])
+				UCM_ERR("no page?\n");
+			else if (!tag_get(slot, settag, offset)){
+				int i;
+				for (i = offset / 16; (i < offset / 16 + 16) &&  i < RADIX_TREE_MAP_MASK; i++)
+					if (slot->slots[i]) {
+						WARN_ON(slot->TSVT[i][SYS_CPU][SYS_CPU] == -1);
+						slot->TSVT[i][SYS_CPU][SYS_CPU]++;
+					}
+			}
+		}
 		tag_set(slot, settag, offset);
 
 		/* walk back up the path tagging interior nodes */
@@ -1254,6 +1397,7 @@ unsigned long radix_tree_locate_item(struct radix_tree_root *root, void *item)
  */
 static inline void radix_tree_shrink(struct radix_tree_root *root)
 {
+	int page_num, i, proc_num;
 	/* try to shrink tree height */
 	while (root->height > 0) {
 		struct radix_tree_node *to_free = root->rnode;
@@ -1266,7 +1410,7 @@ static inline void radix_tree_shrink(struct radix_tree_root *root)
 		 * The candidate node has more than one child, or its child
 		 * is not at the leftmost slot, we cannot shrink.
 		 */
-		if (to_free->count != 1)
+		if (to_free->count != 1 || to_free->count_gpu)
 			break;
 		if (!to_free->slots[0])
 			break;
@@ -1284,6 +1428,11 @@ static inline void radix_tree_shrink(struct radix_tree_root *root)
 			slot = ptr_to_indirect(slot);
 		}
 		root->rnode = slot;
+		for (page_num = 0; page_num < RADIX_TREE_MAP_MASK; page_num++)
+			for (proc_num = 0 ; proc_num < SYS_PROCS; proc_num++)
+				for(i = 0; i < SYS_PROCS; i++)
+					root->rnode->TSVT[page_num][proc_num][i] = 
+					to_free->TSVT[page_num][proc_num][i];
 		root->height--;
 
 		/*
@@ -1331,6 +1480,8 @@ bool __radix_tree_delete_node(struct radix_tree_root *root,
 	do {
 		struct radix_tree_node *parent;
 
+		if (node->count_gpu)
+			return deleted;
 		if (node->count) {
 			if (node == indirect_to_ptr(root->rnode)) {
 				radix_tree_shrink(root);
@@ -1346,6 +1497,7 @@ bool __radix_tree_delete_node(struct radix_tree_root *root,
 
 			offset = node->path >> RADIX_TREE_HEIGHT_SHIFT;
 			parent->slots[offset] = NULL;
+			WARN_ON(!parent->count);
 			parent->count--;
 		} else {
 			root_tag_clear_all(root);
@@ -1407,6 +1559,7 @@ void *radix_tree_delete_item(struct radix_tree_root *root,
 	}
 
 	node->slots[offset] = NULL;
+	WARN_ON(!node->count);
 	node->count--;
 
 	__radix_tree_delete_node(root, node);

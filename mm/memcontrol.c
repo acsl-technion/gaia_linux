@@ -4584,7 +4584,7 @@ static struct page *mc_handle_file_pte(struct vm_area_struct *vma,
 #ifdef CONFIG_SWAP
 	/* shmem/tmpfs may report page out on swap: account for that too. */
 	if (shmem_mapping(mapping)) {
-		page = find_get_entry(mapping, pgoff);
+		page = find_get_entry(mapping, pgoff, 0);
 		if (radix_tree_exceptional_entry(page)) {
 			swp_entry_t swp = radix_to_swp_entry(page);
 			if (do_swap_account)

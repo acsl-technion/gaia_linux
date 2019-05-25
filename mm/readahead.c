@@ -129,7 +129,7 @@ static int read_pages(struct address_space *mapping, struct file *filp,
 		list_del(&page->lru);
 		if (!add_to_page_cache_lru(page, mapping, page->index,
 				mapping_gfp_constraint(mapping, GFP_KERNEL))) {
-			mapping->a_ops->readpage(filp, page);
+				mapping->a_ops->readpage(filp, page);
 		}
 		page_cache_release(page);
 	}
@@ -141,6 +141,17 @@ out:
 	return ret;
 }
 
+static int read_pages_gpu(struct address_space *mapping, struct file *filp,
+		struct list_head *pages, unsigned nr_pages)
+{
+	if (!list_empty(pages) && mapping->a_ops->readpage_dummy) {
+		if (nr_pages != get_multi_pages_from_gpu(mapping, filp, pages, nr_pages))
+			UCM_ERR("Failed getting pages from gpu\n");
+	}
+
+	return 0;
+}
+
 /*
  * __do_page_cache_readahead() actually reads a chunk of disk.  It allocates all
  * the pages first, then submits them all for I/O. This avoids the very bad
@@ -150,22 +161,34 @@ out:
  * Returns the number of pages requested, or the maximum amount of I/O allowed.
  */
 int __do_page_cache_readahead(struct address_space *mapping, struct file *filp,
-			pgoff_t offset, unsigned long nr_to_read,
+			pgoff_t offset_orig, unsigned long nr_to_read,
 			unsigned long lookahead_size)
 {
 	struct inode *inode = mapping->host;
 	struct page *page;
 	unsigned long end_index;	/* The last page we want to read */
-	LIST_HEAD(page_pool);
+	LIST_HEAD(disk_page_pool);
+	LIST_HEAD(gpu_page_pool);
 	int page_idx;
-	int ret = 0;
+	int from_gpu = 0, from_disk = 0;
 	loff_t isize = i_size_read(inode);
+	pgoff_t offset = offset_orig;
 
 	if (isize == 0)
 		goto out;
 
 	end_index = ((isize - 1) >> PAGE_CACHE_SHIFT);
 
+	/* Make offset a round multiply of 16 so we'll be able to fetch from gpu */
+	if (mapping->host->i_ino == 22544394) {
+		if (offset_orig % 16) {
+			offset = (offset_orig / 16) * 16;
+			nr_to_read += offset_orig - offset;
+		}
+		if (nr_to_read % 16) {
+			nr_to_read = (nr_to_read/16 +1) * 16;
+		}
+	}
 	/*
 	 * Preallocate as many pages as we will need.
 	 */
@@ -185,10 +208,22 @@ int __do_page_cache_readahead(struct address_space *mapping, struct file *filp,
 		if (!page)
 			break;
 		page->index = page_offset;
-		list_add(&page->lru, &page_pool);
+
+		BUG_ON(!page);
+		if (get_best_src_for_page(mapping, page->index) == GPU_NVIDIA) {
+			list_add(&page->lru, &gpu_page_pool);
+		//	UCM_DBG("from GPU : idx = %ld\n", page->index);
+			from_gpu++;
+		} else {
+			list_add(&page->lru, &disk_page_pool);
+			from_disk++;
+			//if (mapping->host->i_ino == 22544394)
+			//	UCM_DBG("		from CPU : idx = %ld\n", page->index);
+		}
+
+		//list_add(&page->lru, &page_pool);
 		if (page_idx == nr_to_read - lookahead_size)
 			SetPageReadahead(page);
-		ret++;
 	}
 
 	/*
@@ -196,11 +231,15 @@ int __do_page_cache_readahead(struct address_space *mapping, struct file *filp,
 	 * uptodate then the caller will launch readpage again, and
 	 * will then handle the error.
 	 */
-	if (ret)
-		read_pages(mapping, filp, &page_pool, ret);
-	BUG_ON(!list_empty(&page_pool));
+	if (from_disk)
+		read_pages(mapping, filp, &disk_page_pool, from_disk);
+	BUG_ON(!list_empty(&disk_page_pool));
+
+	if (from_gpu)
+		read_pages_gpu(mapping, filp, &gpu_page_pool, from_gpu);
+	BUG_ON(!list_empty(&gpu_page_pool));
 out:
-	return ret;
+	return from_disk + from_gpu;
 }
 
 /*

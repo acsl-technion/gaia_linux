@@ -46,6 +46,159 @@
 
 #include <asm/mman.h>
 
+static int ucm_get_gpu_idx(pgoff_t offset);
+
+void increase_page_version(struct address_space *mapping, pgoff_t offset, enum system_processors proc_id) {
+	void **pagep;
+	struct page *page;
+	struct radix_tree_node *node = NULL;
+
+	rcu_read_lock();
+repeat:
+	page = NULL;
+	//pagep = radix_tree_lookup_slot(&mapping->page_tree, offset);
+	pagep = radix_tree_lookup_slot_node(&mapping->page_tree, offset, &node);
+	if (node) {
+		int i;
+		int page_slot = offset % RADIX_TREE_MAP_SIZE;
+		node->TSVT[page_slot][proc_id][proc_id]++;
+		if (proc_id < SYS_CPU) {
+			//need to update for the 16 pages
+			int i;
+			for (i = 0; i < 16 ; i++) {
+				page_slot = (offset + i)% RADIX_TREE_MAP_SIZE;
+				node->TSVT[page_slot][proc_id][proc_id]++;
+			}
+		}
+	}
+out:
+	rcu_read_unlock();
+}
+
+/*
+ * If proc_id_set_as = SYS_PROCS then will set the latest version
+ */
+void set_page_version_as_on(struct address_space *mapping, pgoff_t offset,
+		enum system_processors proc_id_to_set, enum system_processors proc_id_set_as) {
+	void **pagep;
+	struct page *page;
+	struct radix_tree_node *node = NULL;
+
+	int page_slot = offset % RADIX_TREE_MAP_SIZE;
+
+
+	page = NULL;
+	pagep = radix_tree_lookup_slot_node(&mapping->page_tree, offset, &node);
+	if (node) {
+		node->TSVT[page_slot][proc_id_to_set][proc_id_set_as] = node->TSVT[page_slot][proc_id_set_as][proc_id_set_as];
+	} else
+		UCM_ERR("Didn't find node to update version for offset =%ld\n", offset);
+}
+
+
+/* 
+ * Returns the version of the page on proc_id. Returns the latest version of the page in *latest_v,
+ * and the process the latest is on in *latest_on.
+ * If the latest version is present on several processors returns according to the following
+ * priority:
+ * cpu, gpu, disk
+ * returns -1 if the page is not cached on proc_id
+ */
+int get_page_version_on(struct address_space *mapping, pgoff_t offset,
+		enum system_processors proc_id, long *page_v) {
+	void **pagep;
+	struct page *page;
+	struct radix_tree_node *node = NULL;
+	int ret = -1;
+	int i;
+	int page_slot = offset % RADIX_TREE_MAP_SIZE;
+
+	for (i = 0; i< SYS_PROCS; i++)
+		page_v[i] = -1;
+
+repeat:
+	page = NULL;
+	pagep = radix_tree_lookup_slot_node(&mapping->page_tree, offset, &node);
+	if (node) {
+		// The requested page is cached an all is good. Find its latest version
+		for (i = 0; i < SYS_PROCS; i++)
+			page_v[i] = node->TSVT[page_slot][proc_id][i];
+		ret = 0;
+	}
+out:
+	return ret ;
+}
+
+int get_page_latest_version(struct address_space *mapping,
+		unsigned long offset, long *page_v) {
+	void **pagep;
+	struct page *page;
+	struct radix_tree_node *node = NULL;
+	int ret = -1;
+	int i, j;
+	int page_slot = offset % RADIX_TREE_MAP_SIZE;
+
+	for (i = 0; i< SYS_PROCS; i++)
+		page_v[i] = -1;
+	page_v[SYS_DISK] = 0;
+
+repeat:
+	page = NULL;
+	pagep = radix_tree_lookup_slot_node(&mapping->page_tree, offset, &node);
+	if (node) {
+		for (i = 0; i < SYS_PROCS; i++)
+			for (j = 0; j < SYS_PROCS; j++)
+				page_v[i] = max(page_v[i], node->TSVT[page_slot][j][i]);
+		ret = 0;
+	}
+out:
+	return ret ;
+}
+
+enum system_processors get_best_src_for_page(struct address_space *mapping,
+		long offset) {
+	enum system_processors ret = SYS_DISK; //this is my default
+
+	void **pagep;
+	struct page *page;
+	struct radix_tree_node *node = NULL;
+	tsvt_vector_t page_v_latest, page_v_gpu;
+	int gpu_id;
+	int page_slot = offset % RADIX_TREE_MAP_SIZE;
+
+	if (!mapping || !mapping->host)
+		return ret;
+
+	(void)get_page_latest_version(mapping, offset , page_v_latest);
+	/* First check if the page is on any of the system gpus */
+	for (gpu_id = 0; gpu_id < SYS_CPU; gpu_id++) {
+		int j;
+		(void)get_page_version_on(mapping, offset, gpu_id, page_v_gpu);
+		/* If page_v[gpu_id] == -1 it means the page is not cache on this gpu */
+		if (page_v_gpu[gpu_id] == -1)
+			continue;
+
+
+		// the page is cached on this gpu. latest_v should be the same as mine
+		for (j = 0; j < SYS_CPU; j++) {
+			if (page_v_latest[j] <= page_v_gpu[j]) ret = gpu_id;
+			else { //latest > page_v
+				/* Its possible that latest[i]=0 and page_v[i] = -1. This is ok */
+				if (page_v_latest[j]==0 && page_v_gpu[j] == -1) ret = gpu_id;
+				else {
+					ret = SYS_DISK;
+					break;
+				}
+			}
+		}
+		if (ret == gpu_id)
+			break;
+	}
+
+	return ret;
+}
+
+
 /*
  * Shared mappings implemented 30.11.1994. It's not fully working yet,
  * though.
@@ -107,10 +260,14 @@
  *
  * ->i_mmap_rwsem
  *   ->tasklist_lock            (memory_failure, collect_procs_ao)
+ *
+ *   I assume this function is called only for cpu pages. for gpu
+ *   pages there is a different function
  */
 
 static int page_cache_tree_insert(struct address_space *mapping,
-				  struct page *page, void **shadowp)
+				  struct page *page, void **shadowp, int gpu_idx,
+				  long *version)
 {
 	struct radix_tree_node *node;
 	void **slot;
@@ -120,6 +277,42 @@ static int page_cache_tree_insert(struct address_space *mapping,
 				    &node, &slot);
 	if (error)
 		return error;
+	if (PageonGPU(page)) {
+		if (gpu_idx >= SYS_CPU || gpu_idx < 0) {
+			UCM_ERR("gpu_idx = %d should be smaller then %d\n ", gpu_idx, SYS_CPU);
+			return -1;
+		}
+		if (node) {
+			int gpu_page_idx = ucm_get_gpu_idx(page->index % RADIX_TREE_MAP_SIZE);
+			int i,j, start_idx;
+			node->gpu_pages[gpu_idx][gpu_page_idx] = page;
+			node->count_gpu++;
+			{
+				struct radix_tree_node *parent = node->parent;
+				while (parent) {
+					parent->count_gpu++;
+					parent = parent->parent;
+				}
+			}
+			start_idx = page->index % RADIX_TREE_MAP_SIZE;
+			//version = node->latest_version[page->index % RADIX_TREE_MAP_SIZE];
+			/* Need to update the version of all the 16 pages since they are cached on GPU */
+			for (i = 0; i < 16 && start_idx + i < RADIX_TREE_MAP_SIZE; i++) {
+				for (j=0; j < SYS_PROCS; j++)
+					node->TSVT[start_idx + i][gpu_idx][j] = version[j];
+			}
+
+			mapping->nrpages++;
+		} else {
+			UCM_ERR("node == NULL index=%lu\n", page->index);
+			return -1;
+		}
+		if (!list_empty(&node->private_list))
+			list_lru_del(&workingset_shadow_nodes,
+				 &node->private_list);
+		return 0;
+	}
+
 	if (*slot) {
 		void *p;
 
@@ -135,7 +328,11 @@ static int page_cache_tree_insert(struct address_space *mapping,
 	radix_tree_replace_slot(slot, page);
 	mapping->nrpages++;
 	if (node) {
+		int i;
 		workingset_node_pages_inc(node);
+		for (i = 0; i < SYS_PROCS; i++)
+			node->TSVT[page->index % RADIX_TREE_MAP_SIZE][SYS_CPU][i] = 
+				version[i];
 		/*
 		 * Don't track node that contains actual pages.
 		 *
@@ -152,13 +349,15 @@ static int page_cache_tree_insert(struct address_space *mapping,
 }
 
 static void page_cache_tree_delete(struct address_space *mapping,
-				   struct page *page, void *shadow)
+				   struct page *page, void *shadow, int gpu_idx)
 {
 	struct radix_tree_node *node;
 	unsigned long index;
 	unsigned int offset;
 	unsigned int tag;
 	void **slot;
+	int i,j;
+	int gpu_page_idx = -1;
 
 	VM_BUG_ON(!PageLocked(page));
 
@@ -184,12 +383,52 @@ static void page_cache_tree_delete(struct address_space *mapping,
 	}
 	mapping->nrpages--;
 
+	if (PageonGPU(page)) {
+		if (gpu_idx >= SYS_CPU || gpu_idx < 0) {
+			UCM_ERR("gpu_idx = %d should be smaller then %d\n ", gpu_idx, SYS_CPU);
+			return;
+		}
+		gpu_page_idx = ucm_get_gpu_idx(page->index % RADIX_TREE_MAP_SIZE);
+
+		if (!node) {
+			UCM_ERR("How come I'm about to remove GPU page and node ==null? idx= %ld\n\n", page->index);
+			return;
+		}
+		if (node->gpu_pages[gpu_idx][gpu_page_idx]) {
+			int start_idx = (page->index % RADIX_TREE_MAP_SIZE / 16) * 16;
+			if (!node->count_gpu)
+				UCM_ERR("node->count_gpu == 0??? \n");
+			else {
+				node->count_gpu--;
+				{
+					struct radix_tree_node *parent = node->parent;
+					while (parent) {
+						if (!parent->count_gpu)
+							break;
+						parent->count_gpu--;
+						parent = parent->parent;
+					}
+				}
+			}
+			node->gpu_pages[gpu_idx][gpu_page_idx] = NULL;
+			for (i=0; i < 16 && start_idx + i < RADIX_TREE_MAP_SIZE; i++) {
+				for (j=0; j< SYS_PROCS; j++)
+					node->TSVT[start_idx + i][gpu_idx][j] = -1;
+				node->TSVT[start_idx + i][gpu_idx][SYS_DISK] = node->TSVT[start_idx + i][SYS_DISK][SYS_DISK];
+			}
+		}
+		return;
+	}
+
 	if (!node) {
 		/* Clear direct pointer tags in root node */
 		mapping->page_tree.gfp_mask &= __GFP_BITS_MASK;
 		radix_tree_replace_slot(slot, shadow);
 		return;
 	}
+	//zero out the page vector on cpu
+	for (i = 0; i < SYS_PROCS; i++)
+		node->TSVT[page->index % RADIX_TREE_MAP_SIZE][SYS_CPU][i] = -1;
 
 	/* Clear tree tags for the removed page */
 	index = page->index;
@@ -204,9 +443,13 @@ static void page_cache_tree_delete(struct address_space *mapping,
 	workingset_node_pages_dec(node);
 	if (shadow)
 		workingset_node_shadows_inc(node);
-	else
-		if (__radix_tree_delete_node(&mapping->page_tree, node))
+	else {
+		int num_gpu= node->count_gpu;
+		if (__radix_tree_delete_node(&mapping->page_tree, node)) {
+			WARN_ON(num_gpu);
 			return;
+		}
+	}
 
 	/*
 	 * Track node that only contains shadow entries.
@@ -216,7 +459,7 @@ static void page_cache_tree_delete(struct address_space *mapping,
 	 * protected by mapping->tree_lock.
 	 */
 	if (!workingset_node_pages(node) &&
-	    list_empty(&node->private_list)) {
+	    list_empty(&node->private_list) && !node->count_gpu) {
 		node->private_data = mapping;
 		list_lru_add(&workingset_shadow_nodes, &node->private_list);
 	}
@@ -233,6 +476,8 @@ void __delete_from_page_cache(struct page *page, void *shadow,
 {
 	struct address_space *mapping = page->mapping;
 
+	WARN_ON(PageonGPU(page));
+
 	trace_mm_filemap_delete_from_page_cache(page);
 	/*
 	 * if we're uptodate, flush out into the cleancache, otherwise
@@ -244,7 +489,7 @@ void __delete_from_page_cache(struct page *page, void *shadow,
 	else
 		cleancache_invalidate_page(mapping, page);
 
-	page_cache_tree_delete(mapping, page, shadow);
+	page_cache_tree_delete(mapping, page, shadow, -1);
 
 	page->mapping = NULL;
 	/* Leave page->index set: truncation lookup relies upon it */
@@ -268,6 +513,32 @@ void __delete_from_page_cache(struct page *page, void *shadow,
 		account_page_cleaned(page, mapping, memcg,
 				     inode_to_wb(mapping->host));
 }
+EXPORT_SYMBOL(__delete_from_page_cache);
+
+void __delete_from_page_cache_gpu(struct page *page, void *shadow,
+			      struct mem_cgroup *memcg, int gpu_idx)
+{
+	struct address_space *mapping = page->mapping;
+	struct ucm_page_data *pdata = (struct ucm_page_data *)page->private;
+
+	VM_BUG_ON_PAGE(!PageonGPU(page), page);
+	trace_mm_filemap_delete_from_page_cache(page);
+	(void)radix_tree_tag_clear(&mapping->page_tree, page->index, PAGECACHE_TAG_ON_GPU);
+
+	cleancache_invalidate_page(mapping, page);
+
+	page_cache_tree_delete(mapping, page, NULL, gpu_idx);
+	page->mapping = NULL;
+	if (!pdata)
+		UCM_ERR("Gpu page has not pdata??? offset=%lld\n", page->index);
+	else {
+		list_del(&pdata->lra);
+		if (mapping->gpu_cached_data_sz )
+			mapping->gpu_cached_data_sz--;
+	}
+	return;
+}
+EXPORT_SYMBOL(__delete_from_page_cache_gpu);
 
 /**
  * delete_from_page_cache - delete page from page cache
@@ -577,6 +848,7 @@ int replace_page_cache_page(struct page *old, struct page *new, gfp_t gfp_mask)
 		void (*freepage)(struct page *);
 		struct mem_cgroup *memcg;
 		unsigned long flags;
+		tsvt_vector_t version;
 
 		pgoff_t offset = old->index;
 		freepage = mapping->a_ops->freepage;
@@ -587,8 +859,9 @@ int replace_page_cache_page(struct page *old, struct page *new, gfp_t gfp_mask)
 
 		memcg = mem_cgroup_begin_page_stat(old);
 		spin_lock_irqsave(&mapping->tree_lock, flags);
+		(void)get_page_version_on(mapping, offset, SYS_CPU, version);
 		__delete_from_page_cache(old, NULL, memcg);
-		error = page_cache_tree_insert(mapping, new, NULL);
+		error = page_cache_tree_insert(mapping, new, NULL, -1, version);
 		BUG_ON(error);
 
 		/*
@@ -611,6 +884,25 @@ int replace_page_cache_page(struct page *old, struct page *new, gfp_t gfp_mask)
 }
 EXPORT_SYMBOL_GPL(replace_page_cache_page);
 
+static int ucm_get_gpu_idx(pgoff_t offset)
+{
+	int index = offset ;//% RADIX_TREE_MAP_MASK; //RADIX_TREE_MAP_MASK = 0x3f = 63
+	int gpu_idx;
+
+	if (index < 16)
+		gpu_idx = 0;
+	else if (index < 32)
+		gpu_idx = 1;
+	else if (index < 48)
+		gpu_idx = 2;
+	else
+		gpu_idx = 3;
+
+	//UCM_DBG("offset=0x%lx goes to gpu_idx %d\n", offset, gpu_idx);
+	return gpu_idx;
+}
+
+
 static int __add_to_page_cache_locked(struct page *page,
 				      struct address_space *mapping,
 				      pgoff_t offset, gfp_t gfp_mask,
@@ -619,11 +911,12 @@ static int __add_to_page_cache_locked(struct page *page,
 	int huge = PageHuge(page);
 	struct mem_cgroup *memcg;
 	int error;
+	tsvt_vector_t version;
 
 	VM_BUG_ON_PAGE(!PageLocked(page), page);
 	VM_BUG_ON_PAGE(PageSwapBacked(page), page);
 
-	if (!huge) {
+	if (!huge && !PageonGPU(page)) {
 		error = mem_cgroup_try_charge(page, current->mm,
 					      gfp_mask, &memcg);
 		if (error)
@@ -632,7 +925,7 @@ static int __add_to_page_cache_locked(struct page *page,
 
 	error = radix_tree_maybe_preload(gfp_mask & ~__GFP_HIGHMEM);
 	if (error) {
-		if (!huge)
+		if (!huge && !PageonGPU(page))
 			mem_cgroup_cancel_charge(page, memcg);
 		return error;
 	}
@@ -642,16 +935,19 @@ static int __add_to_page_cache_locked(struct page *page,
 	page->index = offset;
 
 	spin_lock_irq(&mapping->tree_lock);
-	error = page_cache_tree_insert(mapping, page, shadowp);
+	(void)get_page_latest_version(mapping, offset, version);
+	version[SYS_CPU] = version[SYS_DISK];
+	error = page_cache_tree_insert(mapping, page, shadowp, -1, version);
 	radix_tree_preload_end();
 	if (unlikely(error))
 		goto err_insert;
 
 	/* hugetlb pages do not participate in page cache accounting. */
-	if (!huge)
+	if (!huge && !PageonGPU(page))
 		__inc_zone_page_state(page, NR_FILE_PAGES);
+	
 	spin_unlock_irq(&mapping->tree_lock);
-	if (!huge)
+	if (!huge && !PageonGPU(page)) 
 		mem_cgroup_commit_charge(page, memcg, false);
 	trace_mm_filemap_add_to_page_cache(page);
 	return 0;
@@ -659,11 +955,70 @@ err_insert:
 	page->mapping = NULL;
 	/* Leave page->index set: truncation relies upon it */
 	spin_unlock_irq(&mapping->tree_lock);
-	if (!huge)
-		mem_cgroup_cancel_charge(page, memcg);
-	page_cache_release(page);
+	if (!PageonGPU(page)) {
+		if (!huge)
+			mem_cgroup_cancel_charge(page, memcg);
+		page_cache_release(page);
+	}
 	return error;
 }
+
+
+/**
+ *
+ */
+int add_to_page_cache_gpu(struct page *page,
+				      struct address_space *mapping,
+				      pgoff_t offset, gfp_t gfp_mask,
+				      int gpu_id)
+{
+	int huge = PageHuge(page);
+	struct mem_cgroup *memcg;
+	int error;
+	void *taged_addr;
+	tsvt_vector_t version;
+	struct ucm_page_data *pdata = (struct ucm_page_data *)page->private;
+	unsigned long flags;
+
+	VM_BUG_ON_PAGE(!PageLocked(page), page);
+	VM_BUG_ON_PAGE(!PageonGPU(page), page);
+	VM_BUG_ON_PAGE(PageSwapBacked(page), page);
+
+	error = radix_tree_maybe_preload(gfp_mask & ~__GFP_HIGHMEM);
+	if (error)
+		return error;
+
+	page_cache_get(page);
+	spin_lock_irqsave(&mapping->tree_lock, flags);
+	(void)get_page_latest_version(mapping, offset, version);
+	version[gpu_id] = version[SYS_DISK];
+
+	error = page_cache_tree_insert(mapping, page, NULL, gpu_id, version);
+	radix_tree_preload_end();
+	if (unlikely(error))
+		goto err_insert;
+	radix_tree_tag_set(&mapping->page_tree, page_index(page),
+			PAGECACHE_TAG_ON_GPU);
+	if (!pdata)
+		UCM_ERR("GPU page has not pdata??? offset = %lld\n", offset);
+	else {
+		list_add(&pdata->lra, &mapping->gpu_lra);
+		mapping->gpu_cached_data_sz++;
+	}
+
+	spin_unlock_irqrestore(&mapping->tree_lock, flags);
+
+	return 0;
+err_insert:
+UCM_ERR("Failed adding page at idx %ld to cache: err = %d\n\n", page_index(page), error);
+	page->mapping = NULL;
+
+	/* Leave page->index set: truncation relies upon it */
+	spin_unlock_irqrestore(&mapping->tree_lock, flags);
+
+	return error;
+}
+EXPORT_SYMBOL(add_to_page_cache_gpu);
 
 /**
  * add_to_page_cache_locked - add a locked page to the pagecache
@@ -709,7 +1064,7 @@ int add_to_page_cache_lru(struct page *page, struct address_space *mapping,
 	}
 	return ret;
 }
-EXPORT_SYMBOL_GPL(add_to_page_cache_lru);
+EXPORT_SYMBOL(add_to_page_cache_lru);
 
 #ifdef CONFIG_NUMA
 struct page *__page_cache_alloc(gfp_t gfp)
@@ -1028,6 +1383,8 @@ EXPORT_SYMBOL(page_cache_prev_hole);
  * find_get_entry - find and get a page cache entry
  * @mapping: the address_space to search
  * @offset: the page cache index
+ * @eflags: flags for the entry. Currently used only for GPU_PAGE
+ * 			and the FGP_ON_GPU is reused
  *
  * Looks up the page cache slot at @mapping & @offset.  If there is a
  * page cache page, it is returned with an increased refcount.
@@ -1037,15 +1394,30 @@ EXPORT_SYMBOL(page_cache_prev_hole);
  *
  * Otherwise, %NULL is returned.
  */
-struct page *find_get_entry(struct address_space *mapping, pgoff_t offset)
+struct page *find_get_entry(struct address_space *mapping, pgoff_t offset, int eflags)
 {
 	void **pagep;
 	struct page *page;
+	struct radix_tree_node *node = NULL;
 
 	rcu_read_lock();
 repeat:
 	page = NULL;
-	pagep = radix_tree_lookup_slot(&mapping->page_tree, offset);
+	pagep = radix_tree_lookup_slot_node(&mapping->page_tree, offset, &node);
+	if (node && (eflags & FGP_ON_GPU)) {
+		int gpu_page_idx = ucm_get_gpu_idx(offset % RADIX_TREE_MAP_SIZE);
+
+		if (mapping->page_tree.rnode == node)
+			UCM_ERR("got root\n");
+		if (node->gpu_pages[0][gpu_page_idx])
+			page = node->gpu_pages[0][gpu_page_idx];
+		goto out;
+	} else if (eflags & FGP_ON_GPU) {
+		UCM_DBG("Didn't find node for requested (gpu) index node = %p\n", node);
+		goto out;
+	}
+
+	//If I got heer I'm looking for a cpu page
 	if (pagep) {
 		page = radix_tree_deref_slot(pagep);
 		if (unlikely(!page))
@@ -1101,7 +1473,7 @@ struct page *find_lock_entry(struct address_space *mapping, pgoff_t offset)
 	struct page *page;
 
 repeat:
-	page = find_get_entry(mapping, offset);
+	page = find_get_entry(mapping, offset, 0);
 	if (page && !radix_tree_exception(page)) {
 		lock_page(page);
 		/* Has the page been truncated? */
@@ -1115,6 +1487,185 @@ repeat:
 	return page;
 }
 EXPORT_SYMBOL(find_lock_entry);
+
+#define list_to_page(head) (list_entry((head)->prev, struct page, lru))
+int get_multi_pages_from_gpu(struct address_space *mapping, struct file *filp, struct list_head *page_pool, unsigned nr_pages)
+{
+	int ret = 0, i = 0, res = 0;
+	struct page *page;
+	struct ucm_page_data *pdata;
+	struct page *gpu_page;
+	struct page *pages_arr[16];
+	pgoff_t offset;
+	int page_idx = 0;
+
+	WARN_ON(nr_pages % 16);
+	BUG_ON(!page_pool);
+	while (nr_pages > 0 ) {
+		struct page *first_page = list_to_page(page_pool);
+		if (!first_page) {
+			UCM_ERR("first_page == null!, nr_pages = %ld, i = %d\n", nr_pages, i);
+			return 0;
+		}
+		gpu_page = pagecache_get_gpu_page(mapping, first_page->index, GPU_NVIDIA, true);
+		if (!gpu_page) {
+			UCM_ERR("no gpu page for idx %lld\n", first_page->index);
+			return 0;
+		}
+
+		pdata = (struct ucm_page_data *)gpu_page->private;
+		if (!pdata) {
+			UCM_ERR("pdata = NULL\n");
+			return 0;
+		}
+		if (!pdata->gpu_maped_vma) {
+			UCM_ERR("!pdata->gpu_maped_vma\n");
+			return 0;
+		} else if(!pdata->gpu_maped_vma->ucm_vm_ops) {
+			UCM_ERR("!pdata->gpu_maped_vma->ucm_vm_ops\n");
+			return 0;
+		}
+		if (!pdata->gpu_maped_vma->ucm_vm_ops->retrive_16cached_pages) {
+			UCM_ERR("vma->ucm_vm_ops->retrive_cached_page cb is not provided. cant update page\n");
+			return 0;
+		}
+
+		if (nr_pages < 16) {
+			res = 0;
+			for (page_idx = 0; page_idx < nr_pages; page_idx++) {
+				struct page *page = list_to_page(page_pool);
+				if (!page) {
+					UCM_ERR("null page:first_page.idx= %ld,  page_idx = %d\n", first_page->index, page_idx);
+					return 0;
+				}
+				list_del(&page->lru);
+
+				if (!add_to_page_cache_lru(page, mapping, page->index,
+						mapping_gfp_constraint(mapping, GFP_KERNEL))) {
+					mapping->a_ops->readpage_dummy(filp, page);
+					pages_arr[page_idx] = page;
+				} else
+					UCM_ERR("Failed ading page to cache!\n");
+				if (pdata->gpu_maped_vma->ucm_vm_ops->retrive_cached_page(pdata->shared_addr + (page->index % 16)*PAGE_SIZE, page)) {
+					UCM_ERR("FAIL ++++ retrive_cached_page for offset = %lld FAILED\n", page->index);
+					return 0;
+				}
+				(void)set_page_version_as_on(mapping, page->index, SYS_CPU, GPU_NVIDIA);
+				page_cache_release(page);
+				res++;
+			}
+		} else {
+			for (page_idx = 0; page_idx < 16; page_idx++) {
+				struct page *page = list_to_page(page_pool);
+				if (!page) {
+					UCM_ERR("null page:first_page.idx= %ld,  page_idx = %d\n", first_page->index, page_idx);
+					return 0;
+				}
+				list_del(&page->lru);
+
+				if (!add_to_page_cache_lru(page, mapping, page->index,
+						mapping_gfp_constraint(mapping, GFP_KERNEL))) {
+					mapping->a_ops->readpage_dummy(filp, page);
+					pages_arr[page_idx] = page;
+				} else
+					UCM_ERR("Failed ading page to cache!\n");
+			}
+			res = pdata->gpu_maped_vma->ucm_vm_ops->retrive_16cached_pages(pdata->shared_addr + (first_page->index % 16)*PAGE_SIZE, pages_arr);
+			if (res != 16 ) {
+				UCM_ERR("FAIL ++++ retrive_cached_page for offset = %lld FAILED, res = %d\n", first_page->index, res);
+				WARN_ON(1);
+				//TODO: need to remove all i added from cache and free
+				return res;
+			}
+			for (page_idx = 0; page_idx < 16; page_idx++) {
+				int err;
+				page = pages_arr[page_idx];
+				(void)set_page_version_as_on(mapping, page->index, SYS_CPU, GPU_NVIDIA);
+				page_cache_release(page);
+			}
+		}
+		nr_pages -= res;
+		i+=res;
+	}
+	WARN_ON(!list_empty(page_pool));
+out:
+	return i;
+}
+
+/*
+ * This func should be called ONLY if a cpu page exists but not on its latest version
+ * If CPU page is missing the we should go to read_pages and get the page from gpu
+ * via that code path
+ * Meaning: if page==null its an error
+ */
+struct page *get_page_from_gpu(struct address_space *mapping, pgoff_t offset,
+		struct page *page)
+{
+	struct ucm_page_data *pdata;
+	struct page *gpu_page;
+	bool allocated = false;
+	int err;
+	//UCM_ERR("Found page @offst %lld in cache but not latest version i_ino=%ld. page=0x%llx\n",offset, mapping->host->i_ino, page);
+
+	/* If I got here then latest version is on GPU and I need a CPU page.
+	 * This is because if gpu version was needed and latest is on cpu
+	 * I would have taken careof this in aquire.
+	 * so - need to bring it from gpu to cpu */
+	if (!page) {
+		UCM_ERR("Can't call this func without a backing up cpu page\n");
+		return NULL;
+	}
+	gpu_page = pagecache_get_gpu_page(mapping, offset, GPU_NVIDIA, true);
+	if (!gpu_page) {
+		return NULL;
+	}
+
+	pdata = (struct ucm_page_data *)gpu_page->private;
+	if (!pdata) {
+		UCM_ERR("pdata = NULL\n");
+		return NULL;
+	}
+	if (!pdata->gpu_maped_vma) {
+		UCM_ERR("!pdata->gpu_maped_vma\n");
+		return NULL;
+	} else if(!pdata->gpu_maped_vma->ucm_vm_ops) {
+		UCM_ERR("!pdata->gpu_maped_vma->ucm_vm_ops\n");
+		return NULL;
+	}
+	if (!pdata->gpu_maped_vma->ucm_vm_ops->retrive_cached_page) {
+		UCM_ERR("vma->ucm_vm_ops->retrive_cached_page cb is not provided. cant update page\n");
+		return NULL;
+	}
+
+	if (pdata->gpu_maped_vma->ucm_vm_ops->retrive_cached_page(pdata->shared_addr + (offset % 16)*PAGE_SIZE, page)) {
+		UCM_ERR("FAIL ++++ retrive_cached_page for offset = %lld FAILED\n", offset);
+		if (allocated) {
+			page_cache_release(page);
+			page = NULL;
+			return NULL;
+		}
+	}
+	(void)set_page_version_as_on(mapping, offset,SYS_CPU, GPU_NVIDIA);
+	PageUptodate(page);
+	return page;
+}
+
+int get_16pages_from_gpu(struct address_space *mapping, pgoff_t start_offset,
+		struct page **pages, int num_pages)
+{
+	int i;
+	for (i = 0; i< num_pages; i++) {
+		struct page *page;
+		page = get_page_from_gpu( mapping, start_offset + i, NULL);
+		if (!page ){
+			UCM_ERR("Failed getting page from gpu idx = %ld\n",start_offset + i);
+			return 0;
+		}
+		pages[i] = page;
+		page->flags = 0x2ffff8000000008;
+	}
+	return num_pages;
+}
 
 /**
  * pagecache_get_page - find and get a page reference
@@ -1139,18 +1690,68 @@ EXPORT_SYMBOL(find_lock_entry);
  *
  * If there is a page cache page, it is returned with an increased refcount.
  */
-struct page *pagecache_get_page(struct address_space *mapping, pgoff_t offset,
+struct page *pagecache_get_page_ucm(struct vm_area_struct *vma, struct address_space *mapping, pgoff_t offset,
 	int fgp_flags, gfp_t gfp_mask)
 {
 	struct page *page;
+	tsvt_vector_t page_v, latest_v;
+	int i;
+	bool get_from_gpu_err = false;
+
 
 repeat:
-	page = find_get_entry(mapping, offset);
+	page = find_get_entry(mapping, offset, (fgp_flags & FGP_ON_GPU));
 	if (radix_tree_exceptional_entry(page))
 		page = NULL;
+
+	if (page && (fgp_flags & FGP_ON_GPU) && !PageonGPU(page)) {
+		UCM_ERR("Got some page but its not marked on gpu\n");
+		return NULL;
+	}
+
+	/* Need to make sure that the page I found is at its latest version */
+	(void)get_page_version_on(mapping, offset,
+			((fgp_flags & FGP_ON_GPU) ? GPU_NVIDIA : SYS_CPU), page_v);
+	(void)get_page_latest_version(mapping, offset, latest_v);
+
+
+	//I assume that the version on disk can't be smaller then the one on cpu
+	for (i = 0; i < SYS_PROCS; i++)
+		if (page_v[i] < latest_v[i]) {
+			/*Its possible that I'm looking for a cpu page and the folowing occur:
+			 * the gpu thinks that cpu has version 4 of the page. Meanwhile,
+			 * the page was removed from cpu and thus is added back now, with v=0.
+			 * so I enter this if but I shoudn't since if someone elses version
+			 * for my slot is higher then mine - its their mistake and their needs
+			 * to be updated. May need to be updated when I support flush*/
+			if (!(fgp_flags & FGP_ON_GPU) && i == SYS_CPU);
+			/* There is an end case here if cpu thinks page is not cached on gpu
+			 * (page_v[i]=-1) but the page is cached on gpu but not yet updated
+			 * (latest_v[i] = 0. In this case no need to skip*/
+			else if (page_v[i]==-1 && latest_v[i] == 0);
+			else
+				goto get_from_gpu;
+		}
+	goto next;
+
+get_from_gpu:
+	 {
+		if (fgp_flags & FGP_ON_GPU) {
+			UCM_ERR("How come I got here needing a gpu page???\n");
+			return NULL;
+		}
+		 page = get_page_from_gpu(mapping, offset, page);
+		 if (!page)
+			 get_from_gpu_err = true;
+	}
+next:
 	if (!page)
 		goto no_page;
-
+	if (get_from_gpu_err) {
+		page_cache_release(page);
+		page = NULL;
+		goto no_page;
+	}
 	if (fgp_flags & FGP_LOCK) {
 		if (fgp_flags & FGP_NOWAIT) {
 			if (!trylock_page(page)) {
@@ -1174,6 +1775,7 @@ repeat:
 		mark_page_accessed(page);
 
 no_page:
+next2:
 	if (!page && (fgp_flags & FGP_CREAT)) {
 		int err;
 		if ((fgp_flags & FGP_WRITE) && mapping_cap_account_dirty(mapping))
@@ -1204,7 +1806,75 @@ no_page:
 
 	return page;
 }
+EXPORT_SYMBOL(pagecache_get_page_ucm);
+
+struct page *pagecache_get_page(struct address_space *mapping, pgoff_t offset,
+	int fgp_flags, gfp_t gfp_mask)
+{
+	return pagecache_get_page_ucm(NULL, mapping, offset, fgp_flags, gfp_mask);
+}
 EXPORT_SYMBOL(pagecache_get_page);
+
+/**
+ * pagecache_get_gpu_page - find and get a page reference
+ * @mapping: the address_space to search
+ * @offset: the page index
+ * @fgp_flags: PCG flags
+ * @gfp_mask: gfp mask to use for the page cache data page allocation
+ *
+ * Looks up the page cache slot at @mapping & @offset.
+ *
+ * PCG flags modify how the page is returned.
+ *
+ * FGP_ACCESSED: the page will be marked accessed
+ * FGP_LOCK: Page is return locked
+ * FGP_CREAT: If page is not present then a new page is allocated using
+ *		@gfp_mask and added to the page cache and the VM's LRU
+ *		list. The page is returned locked and with an increased
+ *		refcount. Otherwise, %NULL is returned.
+ *
+ * If FGP_LOCK or FGP_CREAT are specified then the function may sleep even
+ * if the GFP flags specified for FGP_CREAT are atomic.
+ *
+ * If there is a page cache page, it is returned with an increased refcount.
+ */
+struct page *pagecache_get_gpu_page(struct address_space *mapping, pgoff_t offset,
+	int gpu_id, bool ignore_version)
+{
+	void **pagep;
+	struct page *page;
+	struct radix_tree_node *node = NULL;
+
+	rcu_read_lock();
+repeat:
+	page = NULL;
+	pagep = radix_tree_lookup_slot_node(&mapping->page_tree, offset, &node);
+	if (node) {
+		int gpu_page_idx = ucm_get_gpu_idx(offset % RADIX_TREE_MAP_SIZE);
+
+		if (mapping->page_tree.rnode == node)
+			UCM_ERR("got root: num_gpu = %ld node->count = %ld\n", node->count_gpu, node->count);
+		if (node->gpu_pages[gpu_id][gpu_page_idx]) {
+			page = node->gpu_pages[gpu_id][gpu_page_idx];
+		}
+	}
+
+out:
+	rcu_read_unlock();
+
+	if (radix_tree_exceptional_entry(page))
+		page = NULL;
+	if (!page)
+		return NULL;
+
+	if (!PageonGPU(page)) {
+		UCM_ERR("Got some page but its not marked on gpu\n");
+		return NULL;
+	}
+
+	return page;
+}
+EXPORT_SYMBOL(pagecache_get_gpu_page);
 
 /**
  * find_get_entries - gang pagecache lookup
@@ -1500,6 +2170,92 @@ repeat:
 	return ret;
 }
 EXPORT_SYMBOL(find_get_pages_tag);
+
+/**
+ * find_get_CPU_DIRTY_pages - find and return indexes of the
+ * 			pages taged with PAGECACHE_TAG_CPU_DIRTY
+ * @mapping:	the address_space to search
+ * @index:	the starting page index
+  * @nr_pages:	the maximum number of pages
+ * @pages_idx:	where the resulting pages indexes are placed
+ *
+ * Like find_get_pages, except
+ * 1. we only return page indexes and not the pages
+ * 2. return page indexes of pages which are tagged with PAGECACHE_TAG_CPU_DIRTY.
+ *
+ * We update @index to index the next page for the traversal.
+ * It is possible that we return an index of a page that is not cached. This may
+ * happen if the page was flushed to disk and swapped out bu the
+ * PAGECACHE_TAG_CPU_DIRTY tag was not yet cleared from it.
+ */
+unsigned find_get_taged_pages_idx(struct address_space *mapping, pgoff_t *index,
+			unsigned int nr_pages, int *pages_idx, unsigned int tag)
+{
+	struct radix_tree_iter iter;
+	void **slot;
+	unsigned ret = 0;
+
+	if (unlikely(!nr_pages))
+		return 0;
+
+	rcu_read_lock();
+restart:
+	radix_tree_for_each_tagged(slot, &mapping->page_tree,
+				   &iter, *index, tag) {
+		struct page *page;
+repeat:
+		page = radix_tree_deref_slot(slot);
+		if (unlikely(!page)) {
+			UCM_ERR("Page was swaped out. Need to calculate its index...\n");
+			WARN_ON(1);
+			continue;
+		}
+
+		if (radix_tree_exception(page)) {
+			if (radix_tree_deref_retry(page)) {
+				/*
+				 * Transient condition which can only trigger
+				 * when entry at index 0 moves out of or back
+				 * to root: none yet gotten, safe to restart.
+				 */
+				goto restart;
+			}
+			/*
+			 * A shadow entry of a recently evicted page.
+			 *
+			 * Those entries should never be tagged, but
+			 * this tree walk is lockless and the tags are
+			 * looked up in bulk, one radix tree node at a
+			 * time, so there is a sizable window for page
+			 * reclaim to evict a page we saw tagged.
+			 *
+			 * Skip over it.
+			 */
+			continue;
+		}
+
+		if (!page_cache_get_speculative(page))
+			goto repeat;
+
+		/* Has the page moved? */
+		if (unlikely(page != *slot)) {
+			page_cache_release(page);
+			goto repeat;
+		}
+
+		pages_idx[ret] = page->index;
+		if (++ret == nr_pages)
+			break;
+	}
+
+	rcu_read_unlock();
+
+	if (ret)
+		*index = pages_idx[ret - 1] + 1;
+
+	return ret;
+}
+EXPORT_SYMBOL(find_get_taged_pages_idx);
 
 /*
  * CD/DVDs are error prone. When a medium error occurs, the driver may fail
@@ -1827,7 +2583,7 @@ EXPORT_SYMBOL(generic_file_read_iter);
  * This adds the requested page to the page cache if it isn't already there,
  * and schedules an I/O to read in its contents from disk.
  */
-static int page_cache_read(struct file *file, pgoff_t offset)
+int page_cache_read(struct file *file, pgoff_t offset)
 {
 	struct address_space *mapping = file->f_mapping;
 	struct page *page;
@@ -1840,8 +2596,22 @@ static int page_cache_read(struct file *file, pgoff_t offset)
 
 		ret = add_to_page_cache_lru(page, mapping, offset,
 				mapping_gfp_constraint(mapping, GFP_KERNEL));
-		if (ret == 0)
-			ret = mapping->a_ops->readpage(file, page);
+		if (ret == 0){
+			if (mapping->a_ops->readpage_dummy && mapping->host->i_ino == 22544394) {
+				if (get_best_src_for_page(mapping, page->index) == GPU_NVIDIA) {
+					//UCM_DBG("Better get idx %ld from gpu\n",  page->index);
+					mapping->a_ops->readpage_dummy(file, page);
+					if (!get_page_from_gpu(mapping, page->index, page)) {
+						UCM_ERR("Get page from gpu failed idx = %ld, read from disk\n", page->index);
+						mapping->a_ops->readpage(file, page);
+					}
+				} else {
+					ret = mapping->a_ops->readpage(file, page);
+				}
+			} else
+				ret = mapping->a_ops->readpage(file, page);
+
+		}
 		else if (ret == -EEXIST)
 			ret = 0; /* losing race to add is OK */
 
@@ -1851,6 +2621,7 @@ static int page_cache_read(struct file *file, pgoff_t offset)
 
 	return ret;
 }
+EXPORT_SYMBOL(page_cache_read);
 
 #define MMAP_LOTSAMISS  (100)
 
@@ -1858,7 +2629,7 @@ static int page_cache_read(struct file *file, pgoff_t offset)
  * Synchronous readahead happens when we don't even find
  * a page in the page cache at all.
  */
-static void do_sync_mmap_readahead(struct vm_area_struct *vma,
+void do_sync_mmap_readahead(struct vm_area_struct *vma,
 				   struct file_ra_state *ra,
 				   struct file *file,
 				   pgoff_t offset)
@@ -1896,12 +2667,13 @@ static void do_sync_mmap_readahead(struct vm_area_struct *vma,
 	ra->async_size = ra->ra_pages / 4;
 	ra_submit(ra, mapping, file);
 }
+EXPORT_SYMBOL(do_sync_mmap_readahead);
 
 /*
  * Asynchronous readahead happens when we find the page and PG_readahead,
  * so we want to possibly extend the readahead further..
  */
-static void do_async_mmap_readahead(struct vm_area_struct *vma,
+void do_async_mmap_readahead(struct vm_area_struct *vma,
 				    struct file_ra_state *ra,
 				    struct file *file,
 				    struct page *page,
@@ -1914,10 +2686,11 @@ static void do_async_mmap_readahead(struct vm_area_struct *vma,
 		return;
 	if (ra->mmap_miss > 0)
 		ra->mmap_miss--;
-	if (PageReadahead(page))
+	if (PageReadahead(page) || vma->gpu_mapped)
 		page_cache_async_readahead(mapping, ra, file,
 					   page, offset, ra->ra_pages);
 }
+EXPORT_SYMBOL(do_async_mmap_readahead);
 
 /**
  * filemap_fault - read in file data for page fault handling
@@ -1962,7 +2735,8 @@ int filemap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 	/*
 	 * Do we have something in the page cache already?
 	 */
-	page = find_get_page(mapping, offset);
+//	page = find_get_page(mapping, offset);
+	page = pagecache_get_page_ucm(vma, mapping, offset, 0 ,0);
 	if (likely(page) && !(vmf->flags & FAULT_FLAG_TRIED)) {
 		/*
 		 * We found the page, so try async readahead before
@@ -1976,7 +2750,8 @@ int filemap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 		mem_cgroup_count_vm_event(vma->vm_mm, PGMAJFAULT);
 		ret = VM_FAULT_MAJOR;
 retry_find:
-		page = find_get_page(mapping, offset);
+		//page = find_get_page(mapping, offset);
+		page = pagecache_get_page_ucm(vma, mapping, offset, 0 ,0);
 		if (!page)
 			goto no_cached_page;
 	}
@@ -2075,7 +2850,10 @@ void filemap_map_pages(struct vm_area_struct *vma, struct vm_fault *vmf)
 	unsigned long address = (unsigned long) vmf->virtual_address;
 	unsigned long addr;
 	pte_t *pte;
+	int i;
 
+	if (vma->gpu_mapped )
+		return;
 	rcu_read_lock();
 	radix_tree_for_each_slot(slot, &mapping->page_tree, &iter, vmf->pgoff) {
 		if (iter.index > vmf->max_pgoff)
@@ -2104,6 +2882,26 @@ repeat:
 				PageReadahead(page) ||
 				PageHWPoison(page))
 			goto skip;
+
+		/* Check page version */
+		if (!vma->gpu_mapped )	{
+			tsvt_vector_t page_v, latest_v;
+
+			/* Need to make sure that the page I found is at its latest version */
+			(void)get_page_version_on(mapping, page->index, SYS_CPU, page_v);
+			(void)get_page_latest_version(mapping, page->index, latest_v);
+
+			for (i = 0; i < SYS_PROCS; i++)
+				if (page_v[i] < latest_v[i]) {
+					/* There is an end case here if cpu thinks page is not cached on gpu
+					 * (page_v[i]=-1) but the page is cached on gpu but not yet updated
+					 * (latest_v[i] = 0. In this case no need to skip*/
+					if (page_v[i]==-1 && latest_v[i] == 0);
+					else {
+						goto skip;
+					}
+				}
+		}
 		if (!trylock_page(page))
 			goto skip;
 

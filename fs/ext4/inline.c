@@ -820,7 +820,7 @@ static int ext4_da_convert_inline_data_to_extent(struct address_space *mapping,
 		ext4_truncate_failed_write(inode);
 		return ret;
 	}
-
+	SetPagedirty_GPU(page);
 	SetPageDirty(page);
 	SetPageUptodate(page);
 	ext4_clear_inode_state(inode, EXT4_STATE_MAY_INLINE_DATA);
