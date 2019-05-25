@@ -332,6 +332,11 @@
 323	common	userfaultfd		sys_userfaultfd
 324	common	membarrier		sys_membarrier
 325	common	mlock2			sys_mlock2
+327	common  maquire         sys_maquire
+328 common	mrelease		sys_mrelease
+329 common	gpull			sys_gpull
+330 common	ghack			sys_ghack
+
 
 #
 # x32-specific system call numbers start at 512 to avoid cache impact

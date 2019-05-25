@@ -889,4 +889,8 @@ asmlinkage long sys_membarrier(int cmd, int flags);
 
 asmlinkage long sys_mlock2(unsigned long start, size_t len, int flags);
 
+asmlinkage long sys_maquire(unsigned long start, size_t len, int flags);
+asmlinkage long sys_mrelease(unsigned long start, size_t len, int flags);
+asmlinkage long sys_gpull(unsigned long start, size_t len, int flags);
+asmlinkage long sys_ghack(unsigned long start, unsigned long cache_size, unsigned long cache_limit, unsigned long intr);
 #endif

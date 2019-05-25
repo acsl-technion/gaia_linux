@@ -105,3 +105,29 @@ out_unlock:
 out:
 	return error ? : unmapped_error;
 }
+
+#define AQUIRE_PAGES_THREASHOLD 1024
+SYSCALL_DEFINE3(maquire, unsigned long, start, size_t, len, int, flags)
+{
+return 0;
+}
+
+
+SYSCALL_DEFINE3(mrelease, unsigned long, start, size_t, len, int, flags)
+{
+return 0;
+}
+
+
+
+
+/* Hack this func to start a thread to monitor the GPU page cache */
+SYSCALL_DEFINE4(ghack, unsigned long, start, unsigned long, cache_size, unsigned long, cache_limit, unsigned long, intr) {
+
+    return 0 ;
+}
+
+
+SYSCALL_DEFINE3(gpull, unsigned long, start, size_t, len, int, flags) {
+return 0;
+}
