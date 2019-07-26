@@ -1,0 +1,81 @@
+From b85e73688743df70a52745bab69aded4630c6eea Mon Sep 17 00:00:00 2001
+From: Tanya Brokhman <tanya.linder@gmail.com>
+Date: Sat, 25 May 2019 16:46:00 +0300
+Subject: [PATCH 3/6] add new system calls. Empty at the moment. just a place
+ holder
+
+(Keeping the hello syscall in order to maintan the numbers of the other
+system calls)
+Signed-off-by: Tanya Brokhman <tanya.linder@gmail.com>
+---
+ arch/x86/entry/syscalls/syscall_64.tbl |  5 +++++
+ include/linux/syscalls.h               |  4 ++++
+ mm/msync.c                             | 26 ++++++++++++++++++++++++++
+ 3 files changed, 35 insertions(+)
+
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index 314a90b..b818dfa 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -332,6 +332,11 @@
+ 323	common	userfaultfd		sys_userfaultfd
+ 324	common	membarrier		sys_membarrier
+ 325	common	mlock2			sys_mlock2
++327	common  maquire         sys_maquire
++328 common	mrelease		sys_mrelease
++329 common	gpull			sys_gpull
++330 common	ghack			sys_ghack
++
+ 
+ #
+ # x32-specific system call numbers start at 512 to avoid cache impact
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index c2b66a2..ff90635 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -889,4 +889,8 @@ asmlinkage long sys_membarrier(int cmd, int flags);
+ 
+ asmlinkage long sys_mlock2(unsigned long start, size_t len, int flags);
+ 
++asmlinkage long sys_maquire(unsigned long start, size_t len, int flags);
++asmlinkage long sys_mrelease(unsigned long start, size_t len, int flags);
++asmlinkage long sys_gpull(unsigned long start, size_t len, int flags);
++asmlinkage long sys_ghack(unsigned long start, unsigned long cache_size, unsigned long cache_limit, unsigned long intr);
+ #endif
+diff --git a/mm/msync.c b/mm/msync.c
+index 24e612f..5ae1d84 100644
+--- a/mm/msync.c
++++ b/mm/msync.c
+@@ -105,3 +105,29 @@ out_unlock:
+ out:
+ 	return error ? : unmapped_error;
+ }
++
++#define AQUIRE_PAGES_THREASHOLD 1024
++SYSCALL_DEFINE3(maquire, unsigned long, start, size_t, len, int, flags)
++{
++return 0;
++}
++
++
++SYSCALL_DEFINE3(mrelease, unsigned long, start, size_t, len, int, flags)
++{
++return 0;
++}
++
++
++
++
++/* Hack this func to start a thread to monitor the GPU page cache */
++SYSCALL_DEFINE4(ghack, unsigned long, start, unsigned long, cache_size, unsigned long, cache_limit, unsigned long, intr) {
++
++    return 0 ;
++}
++
++
++SYSCALL_DEFINE3(gpull, unsigned long, start, size_t, len, int, flags) {
++return 0;
++}
+-- 
+2.7.4
+

@@ -1,0 +1,188 @@
+From 29d487e54dabfbebce7960bf8665fa3a3ba65134 Mon Sep 17 00:00:00 2001
+From: Tanya Brokhman <tanya.linder@gmail.com>
+Date: Sat, 25 May 2019 09:17:59 +0300
+Subject: [PATCH 2/6] New structures and defines required by GAIA
+
+This commit adds just the definitions of new flags and structures
+used by GAIA. It introduces no changes to the any code flow.
+
+Signed-off-by: Tanya Brokhman <tanya.linder@gmail.com>
+---
+ include/linux/mm.h                     | 14 ++++++++++
+ include/linux/mm_types.h               |  4 +++
+ include/linux/page-flags.h             |  3 +++
+ include/linux/pagemap.h                |  1 +
+ include/linux/ucm.h                    | 47 ++++++++++++++++++++++++++++++++++
+ include/uapi/asm-generic/mman-common.h |  1 +
+ include/uapi/asm-generic/mman.h        |  1 +
+ mm/debug.c                             |  3 +++
+ 8 files changed, 74 insertions(+)
+ create mode 100644 include/linux/ucm.h
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 55f950a..2b1f862 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -146,6 +146,7 @@ extern unsigned int kobjsize(const void *objp);
+ #define VM_ARCH_1	0x01000000	/* Architecture-specific flag */
+ #define VM_ARCH_2	0x02000000
+ #define VM_DONTDUMP	0x04000000	/* Do not include in the core dump */
++#define VM_GPU_MAPPED 	0x08000000	/* GPU mmaped VMA */
+ 
+ #ifdef CONFIG_MEM_SOFT_DIRTY
+ # define VM_SOFTDIRTY	0x08000000	/* Not soft dirty clean area */
+@@ -244,6 +245,19 @@ struct vm_fault {
+ 	pte_t *pte;			/* pte entry associated with ->pgoff */
+ };
+ 
++struct vm_ucm_operations_struct {
++	/* vma - current vma, start - virtual address the mapping starts at (==shared_addr)*/
++	struct file *(*get_mmaped_file)(struct vm_area_struct *vma, unsigned long start, unsigned long end);
++	unsigned long int (*get_cpu_addr)(struct vm_area_struct *vma, unsigned long start, unsigned long end);
++	int (*invalidate_cached_page)(struct vm_area_struct *vma, unsigned long virt_addr);
++	int (*retrive_cached_page)(unsigned long virt_addr, struct page *cpu_page);
++	int (*retrive_16cached_pages)(unsigned long virt_addr, struct page *pages_arr[]);
++	/* Recived the struct page of the gpu_page that was foundin page cahe and returns true if this
++	 * page is dirty on the GPU. Note that this means that 16 cpu pages corresponding to this gpu_page
++	 * have to be invalidated on CPU*/
++	int (*is_gpu_page_dirty)(struct vm_area_struct *vma, struct page *gpu_page);
++};
++
+ /*
+  * These are the virtual MM functions - opening of an area, closing and
+  * unmapping it (needed to keep files on disk up-to-date etc), pointer
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 36f4695..67f3d48 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -348,6 +348,10 @@ struct vm_area_struct {
+ 	struct file * vm_file;		/* File we map to (can be NULL). */
+ 	void * vm_private_data;		/* was vm_pte (shared mem) */
+ 
++	bool gpu_mapped;
++	bool gpu_mapped_shared;
++	const struct vm_ucm_operations_struct *ucm_vm_ops;
++
+ #ifndef CONFIG_MMU
+ 	struct vm_region *vm_region;	/* NOMMU mapping region */
+ #endif
+diff --git a/include/linux/page-flags.h b/include/linux/page-flags.h
+index bb53c7b..4bc6e01 100644
+--- a/include/linux/page-flags.h
++++ b/include/linux/page-flags.h
+@@ -108,6 +108,9 @@ enum pageflags {
+ 	PG_young,
+ 	PG_idle,
+ #endif
++	PG_onGPU,
++	PG_dirty_GPU,
++	PG_from_GPU,
+ 	__NR_PAGEFLAGS,
+ 
+ 	/* Filesystems */
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index fbfadba8..e29a264 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -256,6 +256,7 @@ pgoff_t page_cache_prev_hole(struct address_space *mapping,
+ #define FGP_WRITE		0x00000008
+ #define FGP_NOFS		0x00000010
+ #define FGP_NOWAIT		0x00000020
++#define FGP_ON_GPU		0x00000040
+ 
+ struct page *pagecache_get_page(struct address_space *mapping, pgoff_t offset,
+ 		int fgp_flags, gfp_t cache_gfp_mask);
+diff --git a/include/linux/ucm.h b/include/linux/ucm.h
+new file mode 100644
+index 0000000..7b1db43
+--- /dev/null
++++ b/include/linux/ucm.h
+@@ -0,0 +1,47 @@
++/*
++ * Copyright (C) 2001 Momchil Velikov
++ * Portions Copyright (C) 2001 Christoph Hellwig
++ * Copyright (C) 2006 Nick Piggin
++ * Copyright (C) 2012 Konstantin Khlebnikov
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2, or (at
++ * your option) any later version.
++ * 
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ * 
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++#ifndef _UCM_H
++#define _UCM_H
++
++#define MA_PROC_NVIDIA	0x10
++#define MA_PROC_AMD	0x20
++
++#define CACHE_UP_LIMIT	10 //10% of the gpu cache size
++#define GPU_PAGE_SZ (64*1024)
++
++enum system_processors {
++	GPU_NVIDIA = 0,
++	GPU_AMD,
++	SYS_CPU, //should go after all of system GPUs
++	SYS_DISK,
++	SYS_PROCS
++};
++
++static char *proc_names[] = {"GPU_NVIDIA", "GPU_AMD", "SYS_CPU", "SYS_DISK", "SYS_PROCS"};
++
++struct ucm_page_data {
++	//The virtual address this page is maped to in the nvidia vma
++	unsigned long shared_addr;
++	struct vm_area_struct *gpu_maped_vma;
++	struct list_head lra; //last recently allocated
++	struct page *my_page;
++};
++#endif /* _UCM_H */
+diff --git a/include/uapi/asm-generic/mman-common.h b/include/uapi/asm-generic/mman-common.h
+index a74dd84..11a91d7 100644
+--- a/include/uapi/asm-generic/mman-common.h
++++ b/include/uapi/asm-generic/mman-common.h
+@@ -33,6 +33,7 @@
+ #define MS_ASYNC	1		/* sync memory asynchronously */
+ #define MS_INVALIDATE	2		/* invalidate the caches */
+ #define MS_SYNC		4		/* synchronous memory sync */
++#define MS_GPU		8		/* Release/aquire for GPU mmaped memory */
+ 
+ #define MADV_NORMAL	0		/* no further special treatment */
+ #define MADV_RANDOM	1		/* expect random page references */
+diff --git a/include/uapi/asm-generic/mman.h b/include/uapi/asm-generic/mman.h
+index 7162cd4..f5ffdc6 100644
+--- a/include/uapi/asm-generic/mman.h
++++ b/include/uapi/asm-generic/mman.h
+@@ -12,6 +12,7 @@
+ #define MAP_NONBLOCK	0x10000		/* do not block on IO */
+ #define MAP_STACK	0x20000		/* give out an address that is best suited for process/thread stacks */
+ #define MAP_HUGETLB	0x40000		/* create a huge page mapping */
++#define MAP_ON_GPU	0x80000
+ 
+ /* Bits [26:31] are reserved, see mman-common.h for MAP_HUGETLB usage */
+ 
+diff --git a/mm/debug.c b/mm/debug.c
+index 668aa35..b3eaca2 100644
+--- a/mm/debug.c
++++ b/mm/debug.c
+@@ -47,6 +47,9 @@ static const struct trace_print_flags pageflag_names[] = {
+ 	{1UL << PG_young,		"young"		},
+ 	{1UL << PG_idle,		"idle"		},
+ #endif
++	{1UL << PG_onGPU,		"on_GPU"	},
++	{1UL << PG_dirty_GPU,               "dirty_GPU"        },
++	{1UL << PG_from_GPU,               "from_GPU"        },
+ };
+ 
+ static void dump_flags(unsigned long flags,
+-- 
+2.7.4
+

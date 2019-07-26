@@ -1,0 +1,44 @@
+From 555774a0a9f28fccff67e3529d321c240eeaf1d6 Mon Sep 17 00:00:00 2001
+From: Tanya Brokhman <tanya.linder@gmail.com>
+Date: Sat, 25 May 2019 08:57:25 +0300
+Subject: [PATCH 1/6] logging: Add UCM_* printing functions
+
+UCM_INFO, UCM_ERR, UCM_DBG to be used for logging.
+The calling function name, file and line number will be
+printed.
+
+Signed-off-by: Tanya Brokhman <tanya.linder@gmail.com>
+---
+ include/linux/printk.h | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/include/linux/printk.h b/include/linux/printk.h
+index 9729565..1ae6c10 100644
+--- a/include/linux/printk.h
++++ b/include/linux/printk.h
+@@ -257,6 +257,22 @@ extern asmlinkage void dump_stack(void) __cold;
+ 	printk(KERN_NOTICE pr_fmt(fmt), ##__VA_ARGS__)
+ #define pr_info(fmt, ...) \
+ 	printk(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__)
++
++#define UCM_PRINT_FUNC_PREFIX(prefix, fmt, ...)	\
++	printk(prefix "%s:%u %s " fmt,	\
++	kbasename(__FILE__),		\
++	__LINE__,			\
++	__FUNCTION__,			\
++	##__VA_ARGS__)
++
++#define UCM_ERR(fmt, ...)	\
++	UCM_PRINT_FUNC_PREFIX(KERN_ERR, "UCM-ERR " fmt, ##__VA_ARGS__)
++#define UCM_INFO(fmt, ...)	\
++	UCM_PRINT_FUNC_PREFIX(KERN_INFO, "UCM-INFO " fmt, ##__VA_ARGS__)
++#define UCM_DBG(fmt, ...)	\
++	UCM_PRINT_FUNC_PREFIX(KERN_NOTICE, "UCM-DBG " fmt, ##__VA_ARGS__)
++
++
+ /*
+  * Like KERN_CONT, pr_cont() should only be used when continuing
+  * a line with no newline ('\n') enclosed. Otherwise it defaults
+-- 
+2.7.4
+
